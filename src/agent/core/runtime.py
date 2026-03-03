@@ -74,6 +74,7 @@ class AgentRuntime:
         # 4) Tool-calling loop
         final_text = ""
         tool_iterations = 0
+        last_tool_msgs: List[Dict[str, Any]] = []
 
         while True:
             result = self.llm.generate(
@@ -88,6 +89,8 @@ class AgentRuntime:
 
             # No tool calls -> finalize
             if not result.tool_calls:
+                if self._uses_flat_tool_transcript() and not final_text and last_tool_msgs:
+                    final_text = self._flat_tool_fallback_text(last_tool_msgs)
                 break
 
             tool_iterations += 1
@@ -104,19 +107,50 @@ class AgentRuntime:
                 session_id=session_id,
                 tool_calls=result.tool_calls,
             )
+            last_tool_msgs = tool_msgs
 
             # Append the assistant message that triggered tool calls
             # (Some providers return empty text with tool_calls; still add a marker)
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": result.text or "",
-                    "tool_calls": [self._tool_call_to_provider_shape(tc) for tc in result.tool_calls],
-                }
-            )
+            if self._uses_flat_tool_transcript():
+                # Ollama chat parsing is stricter on role/fields; keep only assistant text.
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": result.text or "",
+                    }
+                )
+            else:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": result.text or "",
+                        "tool_calls": [self._tool_call_to_provider_shape(tc) for tc in result.tool_calls],
+                    }
+                )
 
-            # Append tool results to messages (provider-agnostic "tool" role)
-            messages.extend(tool_msgs)
+            # Append tool results to messages.
+            if self._uses_flat_tool_transcript():
+                for tm in tool_msgs:
+                    tool_name = tm.get("name") or "tool"
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": f"[TOOL RESULT] {tool_name} => {tm.get('content', '')}",
+                        }
+                    )
+                # Ensure next generation is a response turn, not a continuation of assistant logs.
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Use only the tool results above and answer "
+                            "the latest user request in one concise sentence."
+                        ),
+                    }
+                )
+            else:
+                # Provider-agnostic "tool" role (OpenAI-compatible)
+                messages.extend(tool_msgs)
 
         # 5) Persist final assistant message
         self._persist_turn(user_id, session_id, role="assistant", content=final_text)
@@ -171,15 +205,24 @@ class AgentRuntime:
         for t in st_turns:
             role = t["role"]
             content = t["content"]
-            # Tool outputs are stored in ST as role='tool'; we pass them as tool messages
+            # Tool outputs are stored in ST as role='tool'.
             if role == "tool":
-                messages.append(
-                    {
-                        "role": "tool",
-                        "name": t.get("tool_name") or "tool",
-                        "content": t["content"],
-                    }
-                )
+                if self._uses_flat_tool_transcript():
+                    tool_name = t.get("tool_name") or "tool"
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": f"[TOOL LOG] {tool_name}: {content}",
+                        }
+                    )
+                else:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "name": t.get("tool_name") or "tool",
+                            "content": t["content"],
+                        }
+                    )
             else:
                 messages.append({"role": role, "content": content})
 
@@ -196,6 +239,24 @@ class AgentRuntime:
             "Use tools when needed. "
             "If uncertain, state what is missing and propose how to verify."
         )
+
+    def _uses_flat_tool_transcript(self) -> bool:
+        """
+        Ollama's /api/chat can reject OpenAI-style tool transcript fields.
+        For Ollama, flatten tool state into assistant text-only logs.
+        """
+        return self.llm.__class__.__module__.endswith(".providers.llm.ollama")
+
+    def _flat_tool_fallback_text(self, tool_msgs: Sequence[Dict[str, Any]]) -> str:
+        """
+        Fallback text when Ollama returns no assistant content after a tool run.
+        """
+        lines: List[str] = []
+        for tm in tool_msgs:
+            name = tm.get("name") or "tool"
+            content = tm.get("content") or ""
+            lines.append(f"[TOOL RESULT] {name} => {content}")
+        return "\n".join(lines) if lines else "No tool result available."
 
     # ---------------------------------------------------------------------
     # Tools execution

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional, Sequence
-from urllib import request
+from urllib import error, request
 
 from agent.providers.llm.base import LLMProvider, LLMResult, ToolCall, ToolSpec
 from agent.providers.llm._tooling import new_tool_call_id, safe_json_loads
@@ -84,6 +84,17 @@ class OllamaProvider(LLMProvider):
         try:
             with request.urlopen(req, timeout=120) as resp:
                 raw = resp.read().decode("utf-8")
+        except error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                detail = ""
+            if detail:
+                raise RuntimeError(
+                    f"Failed calling Ollama at {url}: HTTP {e.code} {e.reason}. Response body: {detail}"
+                ) from e
+            raise RuntimeError(f"Failed calling Ollama at {url}: HTTP {e.code} {e.reason}") from e
         except Exception as e:
             raise RuntimeError(f"Failed calling Ollama at {url}: {e}") from e
 
