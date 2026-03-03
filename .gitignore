@@ -65,8 +65,9 @@ dmypy.json
 
 # Environments and local configs
 .env
-.env.*
 *.local
+.env.*
+!.env.example
 
 # Logs
 *.log
@@ -82,3 +83,14 @@ pip-delete-this-directory.txt
 # Dependency lock files (uncomment if needed)
 #Pipfile.lock
 #poetry.lock
+
+
+# SQLite local (runtime)
+agent.db
+agent.db-shm
+agent.db-wal
+*.sqlite
+*.sqlite3
+
+workspace/*
+!workspace/.gitkeep
