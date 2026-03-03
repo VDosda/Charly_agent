@@ -40,7 +40,7 @@ class LLMSettings:
     temperature: float = 0.2
     max_tokens: int = 2048
     api_key: Optional[str] = None
-    base_url: Optional[str] = None  # usefull for Ollama or proxy
+    base_url: Optional[str] = None  # useful for Ollama or proxy
 
 
 @dataclass
