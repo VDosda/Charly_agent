@@ -114,6 +114,18 @@ class AgentRuntime:
         )
 
         if decision.blocked_response:
+            self.tracer.emit(
+                event="planner.block",
+                level="warning",
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                payload={
+                    "reason": decision.blocked_response,
+                    "tool_choice": decision.tool_choice,
+                    "user_message": message,
+                },
+            )
             return decision.blocked_response
 
         if decision.system_overrides:
@@ -126,7 +138,17 @@ class AgentRuntime:
             )
 
         if tool_specs:
+            before = len(tool_specs)
             tool_specs = self.planner.filter_tools(tool_specs)
+            after = len(tool_specs)
+            self.tracer.emit(
+                event="planner.tools_filtered",
+                level="debug",
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                payload={"before": before, "after": after},
+            )
 
         tool_choice = decision.tool_choice
 
