@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from agent.providers.llm.base import ToolSpec
 from agent.skills.base import BaseToolHandler, ToolExecutionError
-from agent.skills.registry import Tool
+from agent.skills.registry import Tool, ToolMeta
 
 
 # Root directory where the agent is allowed to read/write files.
@@ -120,6 +120,13 @@ def register_tools(registry, settings):
                 },
             ),
             handler=ReadFileTool(),
+            meta=ToolMeta(
+                tags=frozenset({"filesystem", "read"}),
+                risk="sensitive",
+                default_timeout_s=5.0,
+                scopes=frozenset({"fs:read"}),
+                requires_confirmation=False,
+            ),
         )
     )
 
@@ -139,6 +146,13 @@ def register_tools(registry, settings):
                 },
             ),
             handler=WriteFileTool(),
+            meta=ToolMeta(
+                tags=frozenset({"filesystem", "write"}),
+                risk="dangerous",
+                default_timeout_s=5.0,
+                scopes=frozenset({"fs:write"}),
+                requires_confirmation=True,
+            ),
         )
     )
 
@@ -154,5 +168,12 @@ def register_tools(registry, settings):
                 },
             ),
             handler=ListDirTool(),
+            meta=ToolMeta(
+                tags=frozenset({"filesystem", "read"}),
+                risk="safe",
+                default_timeout_s=5.0,
+                scopes=frozenset({"fs:read"}),
+                requires_confirmation=False,
+            ),
         )
     )

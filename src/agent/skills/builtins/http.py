@@ -5,7 +5,7 @@ from urllib import request
 
 from agent.providers.llm.base import ToolSpec
 from agent.skills.base import BaseToolHandler
-from agent.skills.registry import Tool
+from agent.skills.registry import Tool, ToolMeta
 
 
 class HttpGetTool(BaseToolHandler):
@@ -62,5 +62,12 @@ def register_tools(registry, settings):
         Tool(
             spec=spec,
             handler=HttpGetTool(),
+            meta=ToolMeta(
+                tags=frozenset({"network"}),
+                risk="sensitive",
+                default_timeout_s=15.0,
+                scopes=frozenset({"net:http_get"}),
+                requires_confirmation=False,
+            ),
         )
     )

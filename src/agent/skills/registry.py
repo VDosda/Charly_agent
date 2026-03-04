@@ -1,10 +1,31 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, FrozenSet, List, Literal, Sequence
 
+from agent.config.settings import Settings
 from agent.providers.llm.base import ToolSpec
+
+ToolRisk = Literal["safe", "sensitive", "dangerous"]
+
+
+@dataclass(frozen=True)
+class ToolMeta:
+    """
+    Declarative guardrail metadata attached to each tool.
+    """
+    tags: FrozenSet[str] = field(default_factory=frozenset)
+    risk: ToolRisk = "safe"
+    default_timeout_s: float = 15.0
+    scopes: FrozenSet[str] = field(default_factory=frozenset)
+    requires_confirmation: bool = False
+
+    def __post_init__(self) -> None:
+        if self.risk not in {"safe", "sensitive", "dangerous"}:
+            raise ValueError(f"Invalid tool risk: '{self.risk}'")
+        if self.default_timeout_s <= 0:
+            raise ValueError("Tool default_timeout_s must be > 0")
 
 
 @dataclass(frozen=True)
@@ -13,10 +34,12 @@ class Tool:
     Runtime representation of a tool.
 
     - spec: what we expose to the LLM (name/description/schema)
+    - meta: declarative policy hints (tags/risk/scopes/timeout)
     - handler: callable that executes the tool with validated args
     """
     spec: ToolSpec
     handler: "ToolHandler"
+    meta: ToolMeta = field(default_factory=ToolMeta)
 
 
 class ToolHandler:
@@ -61,6 +84,9 @@ class ToolRegistry:
 
     def list_specs(self) -> List[ToolSpec]:
         return [t.spec for t in self._tools.values()]
+
+    def list_tools(self) -> List[Tool]:
+        return list(self._tools.values())
 
     def list_names(self) -> List[str]:
         return sorted(self._tools.keys())

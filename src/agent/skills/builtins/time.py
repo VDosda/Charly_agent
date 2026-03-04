@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from agent.providers.llm.base import ToolSpec
 from agent.skills.base import BaseToolHandler
-from agent.skills.registry import Tool
+from agent.skills.registry import Tool, ToolMeta
 
 
 class NowTool(BaseToolHandler):
@@ -36,5 +36,12 @@ def register_tools(registry, settings):
         Tool(
             spec=spec,
             handler=NowTool(),
+            meta=ToolMeta(
+                tags=frozenset({"safe"}),
+                risk="safe",
+                default_timeout_s=5.0,
+                scopes=frozenset(),
+                requires_confirmation=False,
+            ),
         )
     )

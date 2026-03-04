@@ -4,16 +4,16 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from agent.config.settings import Settings
-from agent.providers.llm.base import LLMProvider, LLMResult, ToolCall, ToolSpec
+from agent.providers.llm.base import LLMProvider, ToolCall
 from agent.providers.embeddings.base import EmbeddingProvider
-from agent.skills.base import ToolContext, ToolExecutionError
+from agent.skills.base import ToolContext
 from agent.skills.registry import ToolRegistry
 from agent.core.tracing import JSONTracer, new_correlation_id
 from agent.core.tool_runtime import ToolRuntime
-from agent.core.planner import Planner
+from agent.core.planner import Planner, ToolPolicy
 
 
 @dataclass
@@ -61,7 +61,7 @@ class AgentRuntime:
             default_timeout_s=15.0,
             max_workers=4,
         )
-        self.planner = Planner(allow_tools_by_default=True)
+        self.planner = Planner(policy=ToolPolicy.from_settings(settings))
 
     def handle_message(self, user_id: str, session_id: str, message: str) -> str:
         """
@@ -104,13 +104,16 @@ class AgentRuntime:
 
         # 2 Build context for LLM
         messages = self._build_llm_messages(user_id, session_id)
+        policy_state = self._policy_state_for_session(user_id=user_id, session_id=session_id)
 
-        tool_specs = self.skills.list_specs() if self.llm.supports_tools() else None
+        available_tools = self.skills.list_tools() if self.llm.supports_tools() else None
+        tool_specs = None
 
         # 3 Planner policy
         decision = self.planner.decide(
             user_message=message,
-            available_tools=tool_specs,
+            available_tools=available_tools,
+            session_state=policy_state,
         )
 
         if decision.blocked_response:
@@ -137,10 +140,11 @@ class AgentRuntime:
                 },
             )
 
-        if tool_specs:
-            before = len(tool_specs)
-            tool_specs = self.planner.filter_tools(tool_specs)
-            after = len(tool_specs)
+        if available_tools:
+            before = len(available_tools)
+            allowed_tools = self.planner.filter_tools(available_tools, session_state=policy_state)
+            tool_specs = [t.spec for t in allowed_tools]
+            after = len(allowed_tools)
             self.tracer.emit(
                 event="planner.tools_filtered",
                 level="debug",
@@ -151,6 +155,8 @@ class AgentRuntime:
             )
 
         tool_choice = decision.tool_choice
+        if not tool_specs:
+            tool_choice = "none"
 
         # 4 Tool execution loop
         final_text = ""
@@ -212,6 +218,7 @@ class AgentRuntime:
                 user_id=user_id,
                 session_id=session_id,
                 tool_calls=result.tool_calls,
+                session_state=policy_state,
             )
 
             # Append assistant message that triggered tools
@@ -359,6 +366,7 @@ class AgentRuntime:
         user_id: str,
         session_id: str,
         tool_calls: Sequence[ToolCall],
+        session_state: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Execute tool calls via ToolRuntime (timeouts + tracing),
@@ -378,6 +386,7 @@ class AgentRuntime:
         )
 
         rendered_lines: List[str] = []
+        session_state = session_state or {}
 
         for tc in tool_calls:
             name = tc.name
@@ -403,6 +412,44 @@ class AgentRuntime:
                 rendered_lines.append(f"[TOOL RESULT] {name} args={args} => {tool_text}")
                 continue
 
+            # Defense in depth: enforce policy at execution time too.
+            if not self.planner.is_tool_allowed(tool, session_state=session_state):
+                payload = {"ok": False, "error": f"Tool blocked by policy: {name}"}
+                tool_text = json.dumps(payload, ensure_ascii=False)
+
+                self._persist_turn(
+                    user_id=user_id,
+                    session_id=session_id,
+                    role="tool",
+                    content=tool_text,
+                    tool_name=name,
+                    tool_args_json=json.dumps(args, ensure_ascii=False),
+                )
+
+                rendered_lines.append(f"[TOOL RESULT] {name} args={args} => {tool_text}")
+                continue
+
+            if self.planner.requires_confirmation(tool, session_state=session_state):
+                payload = {
+                    "ok": False,
+                    "error": (
+                        f"Tool '{name}' requires explicit confirmation before execution."
+                    ),
+                }
+                tool_text = json.dumps(payload, ensure_ascii=False)
+
+                self._persist_turn(
+                    user_id=user_id,
+                    session_id=session_id,
+                    role="tool",
+                    content=tool_text,
+                    tool_name=name,
+                    tool_args_json=json.dumps(args, ensure_ascii=False),
+                )
+
+                rendered_lines.append(f"[TOOL RESULT] {name} args={args} => {tool_text}")
+                continue
+
             run = self.tool_runtime.run(
                 correlation_id=correlation_id,
                 user_id=user_id,
@@ -410,7 +457,7 @@ class AgentRuntime:
                 tool_spec=tool.spec,
                 args=args,
                 context=ctx,
-                timeout_s=15.0,  # or make it configurable per tool later
+                timeout_s=self.planner.timeout_for(tool, session_state=session_state),
             )
 
             if run.ok:
@@ -438,6 +485,20 @@ class AgentRuntime:
 
         # Return as assistant text instead of role=tool (Ollama-safe)
         return [{"role": "assistant", "content": tool_feedback}]
+
+    def _policy_state_for_session(self, user_id: str, session_id: str) -> Dict[str, Any]:
+        """
+        Extension point for per-user/session policy overrides.
+        Example supported keys:
+        - deny_scopes
+        - deny_tools
+        - deny_tags
+        - deny_risk
+        - allow_tags
+        - confirmed_tools
+        - tool_timeouts_s
+        """
+        return {}
 
 
     def _tool_call_to_provider_shape(self, tc: ToolCall) -> Dict[str, Any]:

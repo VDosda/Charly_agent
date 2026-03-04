@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 
 LLMProviderType = Literal["openai", "anthropic", "ollama"]
@@ -22,11 +22,51 @@ def _env_float(key: str, default: float) -> float:
     return float(value) if value is not None else default
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    value = os.getenv(key)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(f"Invalid boolean for {key}: '{value}'")
+
+
 def _env_list(key: str, default: List[str]) -> List[str]:
     value = os.getenv(key)
     if not value:
         return default
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _env_float_map(key: str, default: Dict[str, float]) -> Dict[str, float]:
+    value = os.getenv(key)
+    if not value:
+        return dict(default)
+
+    out: Dict[str, float] = {}
+
+    for chunk in value.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+
+        if ":" not in item:
+            raise ValueError(f"Invalid '{key}' entry '{item}'. Expected tool:seconds")
+
+        tool_name, timeout_s = item.split(":", 1)
+        name = tool_name.strip()
+
+        if not name:
+            raise ValueError(f"Invalid '{key}' entry '{item}': missing tool name")
+
+        out[name] = float(timeout_s.strip())
+
+    return out
 
 
 # =========================
@@ -74,6 +114,23 @@ class DatabaseSettings:
 
 
 @dataclass
+class ToolPolicySettings:
+    allow_tools_by_default: bool = True
+    allow_network: bool = True
+    allow_filesystem_read: bool = True
+    allow_filesystem_write: bool = False
+
+    deny_tools: List[str] = field(default_factory=list)
+    allow_tags: List[str] = field(default_factory=list)
+    deny_tags: List[str] = field(default_factory=list)
+    deny_scopes: List[str] = field(default_factory=list)
+    deny_risk: List[str] = field(default_factory=list)
+
+    tool_timeouts_s: Dict[str, float] = field(default_factory=dict)
+    enforce_confirmation: bool = False
+
+
+@dataclass
 class Settings:
     env: str
     debug: bool
@@ -86,6 +143,7 @@ class Settings:
     workspace: str
 
     skills_enabled: List[str] = field(default_factory=list)
+    tool_policy: ToolPolicySettings = field(default_factory=ToolPolicySettings)
 
 
 # =========================
@@ -152,6 +210,21 @@ def load_settings() -> Settings:
     )
     workspace = _env("AGENT_WORKSPACE", "workspace")
 
+    # ---- Tool policy ----
+    tool_policy = ToolPolicySettings(
+        allow_tools_by_default=_env_bool("ALLOW_TOOLS_BY_DEFAULT", True),
+        allow_network=_env_bool("ALLOW_NETWORK", True),
+        allow_filesystem_read=_env_bool("ALLOW_FILESYSTEM_READ", True),
+        allow_filesystem_write=_env_bool("ALLOW_FILESYSTEM_WRITE", False),
+        deny_tools=_env_list("DENY_TOOLS", default=[]),
+        allow_tags=_env_list("ALLOW_TAGS", default=[]),
+        deny_tags=_env_list("DENY_TAGS", default=[]),
+        deny_scopes=_env_list("DENY_SCOPES", default=[]),
+        deny_risk=_env_list("DENY_RISK", default=[]),
+        tool_timeouts_s=_env_float_map("TOOL_TIMEOUTS", default={}),
+        enforce_confirmation=_env_bool("ENFORCE_TOOL_CONFIRMATION", False),
+    )
+
     settings = Settings(
         env=env,
         debug=debug,
@@ -161,6 +234,7 @@ def load_settings() -> Settings:
         memory=memory,
         workspace=workspace,
         skills_enabled=skills_enabled,
+        tool_policy=tool_policy,
     )
 
     _validate_settings(settings)
@@ -187,3 +261,14 @@ def _validate_settings(settings: Settings):
 
     if settings.db.vec_extension not in {"sqlite_vec", "sqlite_vss", "none"}:
         raise ValueError("Invalid vector extension type")
+
+    allowed_risks = {"safe", "sensitive", "dangerous"}
+    invalid_risks = [r for r in settings.tool_policy.deny_risk if r not in allowed_risks]
+    if invalid_risks:
+        raise ValueError(
+            f"Invalid DENY_RISK values: {invalid_risks}. Allowed: safe,sensitive,dangerous"
+        )
+
+    for tool_name, timeout_s in settings.tool_policy.tool_timeouts_s.items():
+        if timeout_s <= 0:
+            raise ValueError(f"Invalid timeout for tool '{tool_name}': must be > 0")
