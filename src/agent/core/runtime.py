@@ -11,6 +11,8 @@ from agent.providers.llm.base import LLMProvider, LLMResult, ToolCall, ToolSpec
 from agent.providers.embeddings.base import EmbeddingProvider
 from agent.skills.base import ToolContext, ToolExecutionError
 from agent.skills.registry import ToolRegistry
+from agent.core.tracing import JSONTracer, new_correlation_id
+from agent.core.tool_runtime import ToolRuntime
 
 
 @dataclass
@@ -51,6 +53,13 @@ class AgentRuntime:
             max_tool_iterations=6,
             max_history_turns=settings.memory.st_active_turns,
         )
+        self.tracer = JSONTracer(enabled=True)
+        self.tool_runtime = ToolRuntime(
+            registry=self.skills,
+            tracer=self.tracer,
+            default_timeout_s=15.0,
+            max_workers=4,
+        )
 
     def handle_message(self, user_id: str, session_id: str, message: str) -> str:
         """
@@ -62,6 +71,16 @@ class AgentRuntime:
         - Persist assistant final answer
         - Run MT/LT hooks + cleanup
         """
+        correlation_id = new_correlation_id()
+        self.tracer.emit(
+            event="request.start",
+            level="info",
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            payload={"message_len": len(message)},
+        )
+
         # 1) Persist user message (ST)
         self._persist_turn(user_id, session_id, role="user", content=message)
 
@@ -162,6 +181,14 @@ class AgentRuntime:
         # 7) Cleanup (TTL, compression purge policies, etc.)
         self._cleanup(user_id, session_id)
 
+        self.tracer.emit(
+            event="request.end",
+            level="info",
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            payload={"ok": True, "final_len": len(final_text)},
+        )
         return final_text
 
     # ---------------------------------------------------------------------
@@ -264,15 +291,19 @@ class AgentRuntime:
 
     def _execute_tool_calls(
         self,
+        correlation_id: str,
         user_id: str,
         session_id: str,
         tool_calls: Sequence[ToolCall],
     ) -> List[Dict[str, Any]]:
         """
-        Execute tool calls, persist tool results to ST, and return tool messages.
-        """
-        tool_messages: List[Dict[str, Any]] = []
+        Execute tool calls via ToolRuntime (timeouts + tracing),
+        persist tool results to ST, and return messages to feed back into the LLM.
 
+        IMPORTANT:
+        For Ollama compatibility, we do NOT return role="tool" messages.
+        We return plain text as role="assistant".
+        """
         ctx = ToolContext(
             user_id=user_id,
             session_id=session_id,
@@ -282,21 +313,50 @@ class AgentRuntime:
             },
         )
 
+        rendered_lines: List[str] = []
+
         for tc in tool_calls:
             name = tc.name
             args = tc.arguments or {}
 
+            # Get tool spec (for validation) + execute through ToolRuntime (timeout + tracing)
             try:
-                result = self.skills.execute(name=name, args=args, context=ctx)
-                payload = {"ok": True, "result": result}
-            except ToolExecutionError as e:
-                payload = {"ok": False, "error": str(e)}
-            except Exception as e:
-                # Never raise raw exceptions to the LLM; normalize them
-                payload = {"ok": False, "error": f"Unhandled tool error: {type(e).__name__}: {e}"}
+                tool = self.skills.get(name)  # Tool(spec=ToolSpec, handler=...)
+            except KeyError:
+                payload = {"ok": False, "error": f"Tool not found: {name}"}
+                tool_text = json.dumps(payload, ensure_ascii=False)
+
+                # Persist as tool turn
+                self._persist_turn(
+                    user_id=user_id,
+                    session_id=session_id,
+                    role="tool",
+                    content=tool_text,
+                    tool_name=name,
+                    tool_args_json=json.dumps(args, ensure_ascii=False),
+                )
+
+                rendered_lines.append(f"[TOOL RESULT] {name} args={args} => {tool_text}")
+                continue
+
+            run = self.tool_runtime.run(
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                tool_spec=tool.spec,
+                args=args,
+                context=ctx,
+                timeout_s=15.0,  # or make it configurable per tool later
+            )
+
+            if run.ok:
+                payload = {"ok": True, "result": run.result}
+            else:
+                payload = {"ok": False, "error": run.error, "error_type": run.error_type}
+
+            tool_text = json.dumps(payload, ensure_ascii=False)
 
             # Persist tool output as a ST "tool" turn
-            tool_text = json.dumps(payload, ensure_ascii=False)
             self._persist_turn(
                 user_id=user_id,
                 session_id=session_id,
@@ -304,18 +364,17 @@ class AgentRuntime:
                 content=tool_text,
                 tool_name=name,
                 tool_args_json=json.dumps(args, ensure_ascii=False),
+                tool_result_json=json.dumps(run.result, ensure_ascii=False) if run.ok else None,
             )
 
-            # Add tool message back to LLM conversation
-            tool_messages.append(
-                {
-                    "role": "tool",
-                    "name": name,
-                    "content": tool_text,
-                }
-            )
+            # Feed tool result back to the model as plain text (works for Ollama & others)
+            rendered_lines.append(f"[TOOL RESULT] {name} args={args} => {tool_text}")
 
-        return tool_messages
+        tool_feedback = "\n".join(rendered_lines)
+
+        # Return as assistant text instead of role=tool (Ollama-safe)
+        return [{"role": "assistant", "content": tool_feedback}]
+
 
     def _tool_call_to_provider_shape(self, tc: ToolCall) -> Dict[str, Any]:
         """
