@@ -14,6 +14,7 @@ from agent.skills.registry import ToolRegistry
 from agent.core.tracing import JSONTracer, new_correlation_id
 from agent.core.tool_runtime import ToolRuntime
 from agent.core.planner import Planner, ToolPolicy
+from agent.memory.distill_mt import maybe_create_episode
 
 
 @dataclass
@@ -241,7 +242,11 @@ class AgentRuntime:
         )
 
         # 6 Memory hooks
-        self._maybe_create_episode(user_id, session_id)
+        self._maybe_create_episode(
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
 
         self._maybe_distill_profile(user_id, session_id)
 
@@ -599,18 +604,21 @@ class AgentRuntime:
     # MT/LT hooks (placeholders for next steps)
     # ---------------------------------------------------------------------
 
-    def _maybe_create_episode(self, user_id: str, session_id: str) -> None:
-        """
-        Hook: create a medium-term episode summary every N turns and mark ST turns compressed.
-
-        Implement once you have:
-        - episode_memory table
-        - compressed flag in chat_history (optional)
-        - distillation prompt to summarize a range of turns
-
-        For now: no-op.
-        """
-        return
+    def _maybe_create_episode(
+        self,
+        correlation_id: str,
+        user_id: str,
+        session_id: str,
+    ) -> None:
+        maybe_create_episode(
+            db=self.db,
+            llm=self.llm,
+            embeddings=self.embeddings,
+            tracer=self.tracer,
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
 
     def _maybe_distill_profile(self, user_id: str, session_id: str) -> None:
         """
