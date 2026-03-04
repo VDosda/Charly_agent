@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from agent.config.settings import Settings
-from agent.memory.retrieve import (
-    retrieve_lt_items,
-    retrieve_mt_episodes,
-    render_lt_block,
-    render_mt_block,
+from agent.memory.retrieve_smart import (
+    retrieve_lt_smart,
+    retrieve_mt_smart,
+    render_lt,
+    render_mt,
 )
 from agent.memory.cleanup import cleanup_st
 from agent.providers.llm.base import LLMProvider, ToolCall
@@ -113,9 +113,14 @@ class AgentRuntime:
         )
 
         # 2 Build context for LLM
-        messages = self._build_llm_messages(user_id, session_id)
-        lt = self._retrieve_lt_block(user_id, session_id)
-        mt = self._retrieve_mt_block(user_id, session_id)
+        lt = self._retrieve_lt_block(user_id, session_id, message)
+        mt = self._retrieve_mt_block(user_id, session_id, message)
+        messages = self._build_llm_messages(
+            user_id,
+            session_id,
+            lt_block=lt,
+            mt_block=mt,
+        )
         self.tracer.emit(
             event="memory.inject",
             level="debug",
@@ -290,7 +295,14 @@ class AgentRuntime:
     # Prompt / Context building
     # ---------------------------------------------------------------------
 
-    def _build_llm_messages(self, user_id: str, session_id: str) -> List[Dict[str, Any]]:
+    def _build_llm_messages(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        lt_block: str = "",
+        mt_block: str = "",
+    ) -> List[Dict[str, Any]]:
         """
         Build the LLM message list from:
         - System instructions (stable)
@@ -306,9 +318,6 @@ class AgentRuntime:
             session_id=session_id,
             limit=self.limits.max_history_turns,
         )
-
-        lt_block = self._retrieve_lt_block(user_id, session_id) 
-        mt_block = self._retrieve_mt_block(user_id, session_id)  
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_text}]
 
@@ -660,15 +669,23 @@ class AgentRuntime:
     def _cleanup(self, user_id: str, session_id: str) -> None:
         cleanup_st(self.db, session_id=session_id)
 
-    def _retrieve_lt_block(self, user_id: str, session_id: str) -> str:
-        items = retrieve_lt_items(self.db, user_id=user_id, limit=8, min_importance=0.5)
-        return render_lt_block(items)
-
-    def _retrieve_mt_block(self, user_id: str, session_id: str) -> str:
-        eps = retrieve_mt_episodes(
+    def _retrieve_lt_block(self, user_id: str, session_id: str, user_message: str) -> str:
+        items = retrieve_lt_smart(
             self.db,
+            self.embeddings,
+            user_id=user_id,
+            user_message=user_message,
+            limit=6,
+        )
+        return render_lt(items)
+
+    def _retrieve_mt_block(self, user_id: str, session_id: str, user_message: str) -> str:
+        eps = retrieve_mt_smart(
+            self.db,
+            self.embeddings,
             user_id=user_id,
             session_id=session_id,
+            user_message=user_message,
             limit=3,
         )
-        return render_mt_block(eps)
+        return render_mt(eps)

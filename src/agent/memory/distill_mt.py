@@ -9,6 +9,7 @@ import sqlite3
 
 from agent.core.tracing import JSONTracer
 from agent.memory import store_mt as store
+from agent.memory.vector_store import upsert_episode_vec
 from agent.providers.embeddings.base import EmbeddingProvider
 from agent.providers.embeddings.utils import pack_f32
 from agent.providers.llm.base import LLMProvider
@@ -117,6 +118,7 @@ def maybe_create_episode(
     confidence = _clamp01(_to_float(episode.get("confidence"), default=0.6))
 
     # Embed summary (for later vector retrieval)
+    vec: List[float] = []
     emb_blob = None
     emb_model = None
     emb_dims = None
@@ -154,6 +156,18 @@ def maybe_create_episode(
         embedding_blob=emb_blob,
         source_turn_ids=[t["turn_id"] for t in turns],
     )
+
+    try:
+        upsert_episode_vec(db, episode_id, vec)
+    except Exception as e:
+        tracer.emit(
+            event="mt.vec.upsert.error",
+            level="warning",
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            payload={"episode_id": episode_id, "error": f"{type(e).__name__}: {e}"},
+        )
 
     tracer.emit(
         event="mt.distill.end",

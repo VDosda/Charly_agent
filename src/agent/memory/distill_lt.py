@@ -8,6 +8,7 @@ import sqlite3
 
 from agent.core.tracing import JSONTracer
 from agent.memory.store_lt import upsert_memory_item
+from agent.memory.vector_store import upsert_item_vec
 from agent.providers.embeddings.base import EmbeddingProvider
 from agent.providers.embeddings.utils import pack_f32
 from agent.providers.llm.base import LLMProvider
@@ -82,6 +83,7 @@ def maybe_distill_profile_from_episode(
         if importance < cfg.min_importance:
             continue
 
+        vec: List[float] = []
         emb_blob = None
         emb_model = None
         emb_dims = None
@@ -101,7 +103,7 @@ def maybe_distill_profile_from_episode(
                 payload={"error": f"{type(e).__name__}: {e}"},
             )
 
-        upsert_memory_item(
+        item_id = upsert_memory_item(
             db,
             user_id=user_id,
             kind=kind,
@@ -116,6 +118,17 @@ def maybe_distill_profile_from_episode(
             embedding_dims=emb_dims,
             embedding_blob=emb_blob,
         )
+        try:
+            upsert_item_vec(db, item_id, vec)
+        except Exception as e:
+            tracer.emit(
+                event="lt.vec.upsert.error",
+                level="warning",
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                payload={"item_id": item_id, "error": f"{type(e).__name__}: {e}"},
+            )
         upserted += 1
 
     tracer.emit(
