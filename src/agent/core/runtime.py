@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from agent.config.settings import Settings
-from agent.memory.store_lt import read_top_memory_items
+from agent.memory.retrieve import (
+    retrieve_lt_items,
+    retrieve_mt_episodes,
+    render_lt_block,
+    render_mt_block,
+)
+from agent.memory.cleanup import cleanup_st
 from agent.providers.llm.base import LLMProvider, ToolCall
 from agent.providers.embeddings.base import EmbeddingProvider
 from agent.skills.base import ToolContext
@@ -108,6 +114,16 @@ class AgentRuntime:
 
         # 2 Build context for LLM
         messages = self._build_llm_messages(user_id, session_id)
+        lt = self._retrieve_lt_block(user_id, session_id)
+        mt = self._retrieve_mt_block(user_id, session_id)
+        self.tracer.emit(
+            event="memory.inject",
+            level="debug",
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            payload={"lt_chars": len(lt), "mt_chars": len(mt)},
+        )
         policy_state = self._policy_state_for_session(user_id=user_id, session_id=session_id)
 
         available_tools = self.skills.list_tools() if self.llm.supports_tools() else None
@@ -606,18 +622,8 @@ class AgentRuntime:
     # MT/LT hooks (placeholders for next steps)
     # ---------------------------------------------------------------------
 
-def _maybe_create_episode(self, correlation_id: str, user_id: str, session_id: str) -> None:
-    episode_id = maybe_create_episode(
-        db=self.db,
-        llm=self.llm,
-        embeddings=self.embeddings,
-        tracer=self.tracer,
-        correlation_id=correlation_id,
-        user_id=user_id,
-        session_id=session_id,
-    )
-    if episode_id:
-        maybe_distill_profile_from_episode(
+    def _maybe_create_episode(self, correlation_id: str, user_id: str, session_id: str) -> None:
+        episode_id = maybe_create_episode(
             db=self.db,
             llm=self.llm,
             embeddings=self.embeddings,
@@ -625,8 +631,18 @@ def _maybe_create_episode(self, correlation_id: str, user_id: str, session_id: s
             correlation_id=correlation_id,
             user_id=user_id,
             session_id=session_id,
-            episode_id=episode_id,
         )
+        if episode_id:
+            maybe_distill_profile_from_episode(
+                db=self.db,
+                llm=self.llm,
+                embeddings=self.embeddings,
+                tracer=self.tracer,
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                episode_id=episode_id,
+            )
 
     def _maybe_distill_profile(self, user_id: str, session_id: str) -> None:
         """
@@ -642,33 +658,17 @@ def _maybe_create_episode(self, correlation_id: str, user_id: str, session_id: s
         return
 
     def _cleanup(self, user_id: str, session_id: str) -> None:
-        """
-        Hook: cleanup policies (MT TTL purge, ST archive/purge, etc.).
-        For now: no-op.
-        """
-        return
+        cleanup_st(self.db, session_id=session_id)
 
     def _retrieve_lt_block(self, user_id: str, session_id: str) -> str:
-        items = read_top_memory_items(self.db, user_id=user_id, limit=8, min_importance=0.5)
-        if not items:
-            return ""
-        lines = []
-        for it in items:
-            key = f" ({it['mem_key']})" if it["mem_key"] else ""
-            lines.append(f"- [{it['kind']}{key}] {it['value']} (imp={it['importance']:.2f}, conf={it['confidence']:.2f})")
-        return "\n".join(lines)
+        items = retrieve_lt_items(self.db, user_id=user_id, limit=8, min_importance=0.5)
+        return render_lt_block(items)
 
     def _retrieve_mt_block(self, user_id: str, session_id: str) -> str:
-        rows = self.db.execute(
-            """
-            SELECT summary, importance, confidence, ts
-            FROM episodes
-            WHERE user_id = ? AND session_id = ?
-            ORDER BY ts DESC
-            LIMIT 3
-            """,
-            (user_id, session_id),
-        ).fetchall()
-        if not rows:
-            return ""
-        return "\n\n".join([f"- {r['summary']}" for r in rows])
+        eps = retrieve_mt_episodes(
+            self.db,
+            user_id=user_id,
+            session_id=session_id,
+            limit=3,
+        )
+        return render_mt_block(eps)
