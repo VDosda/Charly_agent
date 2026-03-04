@@ -180,8 +180,8 @@ def load_settings() -> Settings:
 
     # ---- Embeddings ----
     emb_provider: EmbeddingProviderType = _env("EMBED_PROVIDER", "ollama")
-    emb_model = _env("EMBED_MODEL", "nomic-embed-text")
-    emb_dims = _env_int("EMBED_DIMS", 768)
+    emb_model = _env("EMBED_MODEL", "mxbai-x-large")
+    emb_dims = _env_int("EMBED_DIMS", 1024)
 
     embeddings = EmbeddingSettings(
         provider=emb_provider,
