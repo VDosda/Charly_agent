@@ -91,6 +91,7 @@ agent.db-shm
 agent.db-wal
 *.sqlite
 *.sqlite3
+.data/
 
 workspace/*
 !workspace/.gitkeep

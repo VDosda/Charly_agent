@@ -7,6 +7,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from agent.config.settings import Settings
+from agent.memory.retrieve_smart import (
+    retrieve_lt_smart,
+    retrieve_mt_smart,
+)
+from agent.memory.cleanup import cleanup_st
+from agent.memory.context import build_memory_context_blocks
+from agent.memory.models import MemoryBundle
+from agent.memory.scoring import rerank_items, rerank_episodes
 from agent.providers.llm.base import LLMProvider, ToolCall
 from agent.providers.embeddings.base import EmbeddingProvider
 from agent.skills.base import ToolContext
@@ -14,6 +22,9 @@ from agent.skills.registry import ToolRegistry
 from agent.core.tracing import JSONTracer, new_correlation_id
 from agent.core.tool_runtime import ToolRuntime
 from agent.core.planner import Planner, ToolPolicy
+from agent.memory.distill_mt import maybe_create_episode
+from agent.memory.distill_lt import maybe_distill_profile_from_episode
+
 
 
 @dataclass
@@ -104,6 +115,28 @@ class AgentRuntime:
 
         # 2 Build context for LLM
         messages = self._build_llm_messages(user_id, session_id)
+        bundle = self._build_memory_bundle(
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            user_message=message,
+        )
+        mem_blocks = build_memory_context_blocks(bundle)
+        messages[1:1] = mem_blocks
+        lt_chars, mt_chars = self._memory_block_sizes(mem_blocks)
+        self.tracer.emit(
+            event="memory.inject",
+            level="debug",
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            payload={
+                "lt_chars": lt_chars,
+                "mt_chars": mt_chars,
+                "lt_items": len(bundle.lt_items),
+                "mt_episodes": len(bundle.mt_episodes),
+            },
+        )
         policy_state = self._policy_state_for_session(user_id=user_id, session_id=session_id)
 
         available_tools = self.skills.list_tools() if self.llm.supports_tools() else None
@@ -241,7 +274,11 @@ class AgentRuntime:
         )
 
         # 6 Memory hooks
-        self._maybe_create_episode(user_id, session_id)
+        self._maybe_create_episode(
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
 
         self._maybe_distill_profile(user_id, session_id)
 
@@ -266,15 +303,15 @@ class AgentRuntime:
     # Prompt / Context building
     # ---------------------------------------------------------------------
 
-    def _build_llm_messages(self, user_id: str, session_id: str) -> List[Dict[str, Any]]:
+    def _build_llm_messages(
+        self,
+        user_id: str,
+        session_id: str,
+    ) -> List[Dict[str, Any]]:
         """
         Build the LLM message list from:
         - System instructions (stable)
-        - Long-term memories (LT) [hook placeholder]
-        - Medium-term episodes (MT) [hook placeholder]
         - Recent short-term turns (ST)
-
-        For now, we implement ST-only injection + placeholders for MT/LT.
         """
         system_text = self._system_prompt()
 
@@ -283,21 +320,7 @@ class AgentRuntime:
             limit=self.limits.max_history_turns,
         )
 
-        # Placeholders: in later phases, you will retrieve MT/LT here.
-        lt_block = self._retrieve_lt_block(user_id, session_id)  # can be ""
-        mt_block = self._retrieve_mt_block(user_id, session_id)  # can be ""
-
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_text}]
-
-        # Inject LT/MT as a compact system-ish memory block (keeps it high priority)
-        mem_parts = []
-        if lt_block:
-            mem_parts.append("LONG-TERM MEMORY:\n" + lt_block)
-        if mt_block:
-            mem_parts.append("MEDIUM-TERM EPISODES:\n" + mt_block)
-
-        if mem_parts:
-            messages.append({"role": "system", "content": "\n\n".join(mem_parts)})
 
         # Add ST turns
         for t in st_turns:
@@ -570,16 +593,30 @@ class AgentRuntime:
         """
         Read the last N turns for this session, ordered oldest->newest.
         """
-        rows = self.db.execute(
-            """
-            SELECT role, content, tool_name, tool_args_json, tool_result_json
-            FROM chat_history
-            WHERE session_id = ?
-            ORDER BY turn_id DESC
-            LIMIT ?
-            """,
-            (session_id, limit),
-        ).fetchall()
+        try:
+            rows = self.db.execute(
+                """
+                SELECT role, content, tool_name, tool_args_json, tool_result_json
+                FROM chat_history
+                WHERE session_id = ?
+                  AND archived = 0
+                ORDER BY turn_id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Backward-compat fallback when archived column is not present yet.
+            rows = self.db.execute(
+                """
+                SELECT role, content, tool_name, tool_args_json, tool_result_json
+                FROM chat_history
+                WHERE session_id = ?
+                ORDER BY turn_id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
 
         # Reverse to get chronological order
         out = []
@@ -599,18 +636,27 @@ class AgentRuntime:
     # MT/LT hooks (placeholders for next steps)
     # ---------------------------------------------------------------------
 
-    def _maybe_create_episode(self, user_id: str, session_id: str) -> None:
-        """
-        Hook: create a medium-term episode summary every N turns and mark ST turns compressed.
-
-        Implement once you have:
-        - episode_memory table
-        - compressed flag in chat_history (optional)
-        - distillation prompt to summarize a range of turns
-
-        For now: no-op.
-        """
-        return
+    def _maybe_create_episode(self, correlation_id: str, user_id: str, session_id: str) -> None:
+        episode_id = maybe_create_episode(
+            db=self.db,
+            llm=self.llm,
+            embeddings=self.embeddings,
+            tracer=self.tracer,
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if episode_id:
+            maybe_distill_profile_from_episode(
+                db=self.db,
+                llm=self.llm,
+                embeddings=self.embeddings,
+                tracer=self.tracer,
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                episode_id=episode_id,
+            )
 
     def _maybe_distill_profile(self, user_id: str, session_id: str) -> None:
         """
@@ -626,22 +672,70 @@ class AgentRuntime:
         return
 
     def _cleanup(self, user_id: str, session_id: str) -> None:
-        """
-        Hook: cleanup policies (MT TTL purge, ST archive/purge, etc.).
-        For now: no-op.
-        """
-        return
+        cleanup_st(self.db, session_id=session_id)
 
-    def _retrieve_lt_block(self, user_id: str, session_id: str) -> str:
-        """
-        Hook: retrieve relevant long-term memory as a compact string.
-        For now: empty (no LT yet).
-        """
-        return ""
+    def _build_memory_bundle(
+        self,
+        *,
+        correlation_id: str,
+        user_id: str,
+        session_id: str,
+        user_message: str,
+    ) -> MemoryBundle:
+        items_with_dist = []
+        eps_with_dist = []
 
-    def _retrieve_mt_block(self, user_id: str, session_id: str) -> str:
-        """
-        Hook: retrieve relevant episode summaries as a compact string.
-        For now: empty (no MT yet).
-        """
-        return ""
+        try:
+            items_with_dist = retrieve_lt_smart(
+                self.db,
+                self.embeddings,
+                user_id=user_id,
+                user_message=user_message,
+                limit=6,
+            )
+        except Exception as e:
+            self.tracer.emit(
+                event="memory.retrieve.lt.error",
+                level="warning",
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                payload={"error": f"{type(e).__name__}: {e}"},
+            )
+
+        try:
+            eps_with_dist = retrieve_mt_smart(
+                self.db,
+                self.embeddings,
+                user_id=user_id,
+                session_id=session_id,
+                user_message=user_message,
+                limit=3,
+            )
+        except Exception as e:
+            self.tracer.emit(
+                event="memory.retrieve.mt.error",
+                level="warning",
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                payload={"error": f"{type(e).__name__}: {e}"},
+            )
+
+        return MemoryBundle(
+            lt_items=rerank_items(items_with_dist, limit=6),
+            mt_episodes=rerank_episodes(eps_with_dist, limit=3),
+        )
+
+    def _memory_block_sizes(self, mem_blocks: Sequence[Dict[str, str]]) -> tuple[int, int]:
+        lt_chars = 0
+        mt_chars = 0
+
+        for block in mem_blocks:
+            content = block.get("content", "")
+            if content.startswith("LONG-TERM MEMORY"):
+                lt_chars = len(content)
+            elif content.startswith("MEDIUM-TERM EPISODES"):
+                mt_chars = len(content)
+
+        return lt_chars, mt_chars

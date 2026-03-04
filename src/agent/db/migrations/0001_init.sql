@@ -40,7 +40,12 @@ CREATE TABLE IF NOT EXISTS chat_history (
     -- tool metadata (nullable)
     tool_name TEXT,
     tool_args_json TEXT,
-    tool_result_json TEXT
+    tool_result_json TEXT,
+
+    -- ST archival flag
+    -- 0 = active turns injected in prompt
+    -- 1 = archived turns (cleanup/summarized)
+    archived INTEGER NOT NULL DEFAULT 0
 );
 
 
@@ -68,3 +73,7 @@ ON chat_history(ts);
 -- Ensure unique turn order within a session
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_session_turn_unique
 ON chat_history(session_id, turn_id);
+
+-- Fast retrieval of active (non-archived) ST turns
+CREATE INDEX IF NOT EXISTS idx_chat_history_archived
+ON chat_history(session_id, archived, turn_id);
