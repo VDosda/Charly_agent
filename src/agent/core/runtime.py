@@ -20,6 +20,7 @@ from agent.providers.embeddings.base import EmbeddingProvider
 from agent.skills.base import ToolContext
 from agent.skills.registry import ToolRegistry
 from agent.core.tracing import JSONTracer, new_correlation_id
+from agent.core.tracing_db import DBTracer, MultiTracer
 from agent.core.tool_runtime import ToolRuntime
 from agent.core.planner import Planner, ToolPolicy
 from agent.memory.distill_mt import maybe_create_episode
@@ -65,7 +66,10 @@ class AgentRuntime:
             max_tool_iterations=6,
             max_history_turns=settings.memory.st_active_turns,
         )
-        self.tracer = JSONTracer(enabled=True)
+        self.tracer = MultiTracer(
+            JSONTracer(enabled=settings.trace_stdout),
+            DBTracer(db=self.db, enabled=True),
+        )
         self.tool_runtime = ToolRuntime(
             registry=self.skills,
             tracer=self.tracer,

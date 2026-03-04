@@ -1,7 +1,9 @@
 import sqlite3
+from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
+from agent.config.settings import load_settings
 from agent.config.settings import VecExtensionType
 
 
@@ -96,3 +98,19 @@ def _load_vector_extension(
 
     else:
         raise ValueError(f"Unsupported vector extension: {extension_type}")
+
+
+@lru_cache(maxsize=1)
+def _cached_connection() -> sqlite3.Connection:
+    settings = load_settings()
+    return get_connection(
+        db_path=settings.db.path,
+        vec_extension=settings.db.vec_extension,
+    )
+
+
+def get_db() -> Iterator[sqlite3.Connection]:
+    """
+    FastAPI dependency that yields a shared SQLite connection.
+    """
+    yield _cached_connection()

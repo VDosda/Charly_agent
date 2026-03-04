@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import List, Sequence
-from urllib import request
+from urllib import error, request
 
 from agent.providers.embeddings.base import EmbeddingProvider, EmbeddingResult
 
@@ -39,20 +39,65 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
         return EmbeddingResult(vectors=vectors, dimensions=self.dimensions, model=self.model)
 
     def _embed_one(self, text: str) -> List[float]:
+        # Preferred Ollama endpoint (recent versions)
+        try:
+            return self._embed_via_embed_endpoint(text)
+        except error.HTTPError as e:
+            # Backward compatibility with older Ollama endpoint
+            if e.code != 404:
+                raise RuntimeError(f"Failed calling Ollama embeddings at /api/embed: HTTP {e.code} {e.reason}") from e
+
+        return self._embed_via_embeddings_endpoint(text)
+
+    def _embed_via_embed_endpoint(self, text: str) -> List[float]:
+        url = f"{self.base_url}/api/embed"
+        payload = {"model": self.model, "input": text}
+        obj = self._post_json(url, payload)
+
+        vectors = obj.get("embeddings")
+        if isinstance(vectors, list) and vectors:
+            vec = vectors[0]
+            if not isinstance(vec, list):
+                raise RuntimeError("Ollama /api/embed response 'embeddings[0]' is not a list")
+            return [float(x) for x in vec]
+
+        # Some proxies/versions may still return "embedding" shape.
+        vec = obj.get("embedding")
+        if not isinstance(vec, list):
+            raise RuntimeError(
+                "Ollama /api/embed response missing vector in 'embeddings' or 'embedding'"
+            )
+        return [float(x) for x in vec]
+
+    def _embed_via_embeddings_endpoint(self, text: str) -> List[float]:
         url = f"{self.base_url}/api/embeddings"
         payload = {"model": self.model, "prompt": text}
+        obj = self._post_json(url, payload)
+
+        vec = obj.get("embedding")
+        if not isinstance(vec, list):
+            raise RuntimeError("Ollama /api/embeddings response missing 'embedding' list")
+
+        return [float(x) for x in vec]
+
+    def _post_json(self, url: str, payload: dict) -> dict:
         data = json.dumps(payload).encode("utf-8")
         req = request.Request(url, data=data, headers={"Content-Type": "application/json"})
 
         try:
             with request.urlopen(req, timeout=120) as resp:
                 raw = resp.read().decode("utf-8")
+        except error.HTTPError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed calling Ollama embeddings at {url}: {e}") from e
 
-        obj = json.loads(raw)
-        vec = obj.get("embedding")
-        if not isinstance(vec, list):
-            raise RuntimeError("Ollama embeddings response missing 'embedding' list")
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid JSON from Ollama embeddings endpoint {url}") from e
 
-        return [float(x) for x in vec]
+        if not isinstance(obj, dict):
+            raise RuntimeError(f"Unexpected Ollama embeddings response type at {url}: {type(obj).__name__}")
+
+        return obj
