@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from agent.config.settings import Settings
+from agent.memory.store_lt import read_top_memory_items
 from agent.providers.llm.base import LLMProvider, ToolCall
 from agent.providers.embeddings.base import EmbeddingProvider
 from agent.skills.base import ToolContext
@@ -15,6 +16,8 @@ from agent.core.tracing import JSONTracer, new_correlation_id
 from agent.core.tool_runtime import ToolRuntime
 from agent.core.planner import Planner, ToolPolicy
 from agent.memory.distill_mt import maybe_create_episode
+from agent.memory.distill_lt import maybe_distill_profile_from_episode
+
 
 
 @dataclass
@@ -288,9 +291,8 @@ class AgentRuntime:
             limit=self.limits.max_history_turns,
         )
 
-        # Placeholders: in later phases, you will retrieve MT/LT here.
-        lt_block = self._retrieve_lt_block(user_id, session_id)  # can be ""
-        mt_block = self._retrieve_mt_block(user_id, session_id)  # can be ""
+        lt_block = self._retrieve_lt_block(user_id, session_id) 
+        mt_block = self._retrieve_mt_block(user_id, session_id)  
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_text}]
 
@@ -604,13 +606,18 @@ class AgentRuntime:
     # MT/LT hooks (placeholders for next steps)
     # ---------------------------------------------------------------------
 
-    def _maybe_create_episode(
-        self,
-        correlation_id: str,
-        user_id: str,
-        session_id: str,
-    ) -> None:
-        maybe_create_episode(
+def _maybe_create_episode(self, correlation_id: str, user_id: str, session_id: str) -> None:
+    episode_id = maybe_create_episode(
+        db=self.db,
+        llm=self.llm,
+        embeddings=self.embeddings,
+        tracer=self.tracer,
+        correlation_id=correlation_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    if episode_id:
+        maybe_distill_profile_from_episode(
             db=self.db,
             llm=self.llm,
             embeddings=self.embeddings,
@@ -618,6 +625,7 @@ class AgentRuntime:
             correlation_id=correlation_id,
             user_id=user_id,
             session_id=session_id,
+            episode_id=episode_id,
         )
 
     def _maybe_distill_profile(self, user_id: str, session_id: str) -> None:
@@ -641,15 +649,26 @@ class AgentRuntime:
         return
 
     def _retrieve_lt_block(self, user_id: str, session_id: str) -> str:
-        """
-        Hook: retrieve relevant long-term memory as a compact string.
-        For now: empty (no LT yet).
-        """
-        return ""
+        items = read_top_memory_items(self.db, user_id=user_id, limit=8, min_importance=0.5)
+        if not items:
+            return ""
+        lines = []
+        for it in items:
+            key = f" ({it['mem_key']})" if it["mem_key"] else ""
+            lines.append(f"- [{it['kind']}{key}] {it['value']} (imp={it['importance']:.2f}, conf={it['confidence']:.2f})")
+        return "\n".join(lines)
 
     def _retrieve_mt_block(self, user_id: str, session_id: str) -> str:
-        """
-        Hook: retrieve relevant episode summaries as a compact string.
-        For now: empty (no MT yet).
-        """
-        return ""
+        rows = self.db.execute(
+            """
+            SELECT summary, importance, confidence, ts
+            FROM episodes
+            WHERE user_id = ? AND session_id = ?
+            ORDER BY ts DESC
+            LIMIT 3
+            """,
+            (user_id, session_id),
+        ).fetchall()
+        if not rows:
+            return ""
+        return "\n\n".join([f"- {r['summary']}" for r in rows])

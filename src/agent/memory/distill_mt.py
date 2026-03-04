@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import sqlite3
 
 from agent.core.tracing import JSONTracer
-from agent.memory import store
+from agent.memory import store_mt as store
 from agent.providers.embeddings.base import EmbeddingProvider
 from agent.providers.embeddings.utils import pack_f32
 from agent.providers.llm.base import LLMProvider
