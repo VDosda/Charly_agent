@@ -13,6 +13,7 @@ from agent.skills.base import ToolContext, ToolExecutionError
 from agent.skills.registry import ToolRegistry
 from agent.core.tracing import JSONTracer, new_correlation_id
 from agent.core.tool_runtime import ToolRuntime
+from agent.core.planner import Planner
 
 
 @dataclass
@@ -60,136 +61,177 @@ class AgentRuntime:
             default_timeout_s=15.0,
             max_workers=4,
         )
+        self.planner = Planner(allow_tools_by_default=True)
 
     def handle_message(self, user_id: str, session_id: str, message: str) -> str:
         """
-        Main entrypoint:
-        - Persist user message
-        - Build context
-        - Call LLM
-        - If tool calls: execute, persist tool results, call LLM again
-        - Persist assistant final answer
-        - Run MT/LT hooks + cleanup
-        """
+            Main entrypoint of the agent runtime.
+
+            Flow:
+                user message
+                    ↓
+                persist ST
+                    ↓
+                planner policy
+                    ↓
+                LLM call
+                    ↓
+                tool loop
+                    ↓
+                persist assistant answer
+                    ↓
+                MT/LT hooks
+            """
+
         correlation_id = new_correlation_id()
+
         self.tracer.emit(
             event="request.start",
             level="info",
             correlation_id=correlation_id,
             user_id=user_id,
             session_id=session_id,
-            payload={"message_len": len(message)},
+            payload={"message": message},
         )
 
-        # 1) Persist user message (ST)
-        self._persist_turn(user_id, session_id, role="user", content=message)
+        # 1 Persist user message (ST)
+        self._persist_turn(
+            user_id=user_id,
+            session_id=session_id,
+            role="user",
+            content=message,
+        )
 
-        # 2) Build messages for LLM
+        # 2 Build context for LLM
         messages = self._build_llm_messages(user_id, session_id)
 
-        # 3) Tool specs for this run
         tool_specs = self.skills.list_specs() if self.llm.supports_tools() else None
 
-        # 4) Tool-calling loop
+        # 3 Planner policy
+        decision = self.planner.decide(
+            user_message=message,
+            available_tools=tool_specs,
+        )
+
+        if decision.blocked_response:
+            return decision.blocked_response
+
+        if decision.system_overrides:
+            messages.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": decision.system_overrides,
+                },
+            )
+
+        if tool_specs:
+            tool_specs = self.planner.filter_tools(tool_specs)
+
+        tool_choice = decision.tool_choice
+
+        # 4 Tool execution loop
         final_text = ""
         tool_iterations = 0
-        last_tool_msgs: List[Dict[str, Any]] = []
 
         while True:
+
+            self.tracer.emit(
+                event="llm.request",
+                level="debug",
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                payload={
+                    "messages": len(messages),
+                    "tool_choice": tool_choice,
+                },
+            )
+
             result = self.llm.generate(
                 messages=messages,
                 tools=tool_specs,
-                tool_choice="auto",
+                tool_choice=tool_choice,
             )
 
-            # If model produced text, keep it (might be partial if tool calls follow)
             if result.text:
                 final_text = result.text
 
-            # No tool calls -> finalize
+            self.tracer.emit(
+                event="llm.response",
+                level="debug",
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                payload={
+                    "tool_calls": len(result.tool_calls or []),
+                    "text_len": len(result.text or ""),
+                },
+            )
+
+            # If no tools requested -> exit loop
             if not result.tool_calls:
-                if self._uses_flat_tool_transcript() and not final_text and last_tool_msgs:
-                    final_text = self._flat_tool_fallback_text(last_tool_msgs)
                 break
 
             tool_iterations += 1
+
             if tool_iterations > self.limits.max_tool_iterations:
+
                 final_text = (
                     "ERROR: tool loop exceeded max iterations. "
-                    "Refusing to continue for safety."
+                    "Stopping execution for safety."
                 )
+
                 break
 
-            # Execute each tool call and append tool results to the messages
+            # Execute tools via ToolRuntime
             tool_msgs = self._execute_tool_calls(
+                correlation_id=correlation_id,
                 user_id=user_id,
                 session_id=session_id,
                 tool_calls=result.tool_calls,
             )
-            last_tool_msgs = tool_msgs
 
-            # Append the assistant message that triggered tool calls
-            # (Some providers return empty text with tool_calls; still add a marker)
-            if self._uses_flat_tool_transcript():
-                # Ollama chat parsing is stricter on role/fields; keep only assistant text.
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": result.text or "",
-                    }
-                )
-            else:
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": result.text or "",
-                        "tool_calls": [self._tool_call_to_provider_shape(tc) for tc in result.tool_calls],
-                    }
-                )
+            # Append assistant message that triggered tools
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": result.text or "",
+                }
+            )
 
-            # Append tool results to messages.
-            if self._uses_flat_tool_transcript():
-                for tm in tool_msgs:
-                    tool_name = tm.get("name") or "tool"
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": f"[TOOL RESULT] {tool_name} => {tm.get('content', '')}",
-                        }
-                    )
-                # Ensure next generation is a response turn, not a continuation of assistant logs.
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Use only the tool results above and answer "
-                            "the latest user request in one concise sentence."
-                        ),
-                    }
-                )
-            else:
-                # Provider-agnostic "tool" role (OpenAI-compatible)
-                messages.extend(tool_msgs)
+            # Append tool feedback messages
+            messages.extend(tool_msgs)
 
-        # 5) Persist final assistant message
-        self._persist_turn(user_id, session_id, role="assistant", content=final_text)
+        # 5 Persist assistant answer
+        self._persist_turn(
+            user_id=user_id,
+            session_id=session_id,
+            role="assistant",
+            content=final_text,
+        )
 
-        # 6) MT/LT hooks (safe no-ops until implemented)
+        # 6 Memory hooks
         self._maybe_create_episode(user_id, session_id)
+
         self._maybe_distill_profile(user_id, session_id)
 
-        # 7) Cleanup (TTL, compression purge policies, etc.)
+
+        # 7 Cleanup
         self._cleanup(user_id, session_id)
 
+        # 8 Tracing end
         self.tracer.emit(
             event="request.end",
             level="info",
             correlation_id=correlation_id,
             user_id=user_id,
             session_id=session_id,
-            payload={"ok": True, "final_len": len(final_text)},
+            payload={"response_len": len(final_text)},
         )
+
         return final_text
+
 
     # ---------------------------------------------------------------------
     # Prompt / Context building
