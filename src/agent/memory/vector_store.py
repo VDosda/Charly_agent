@@ -92,8 +92,8 @@ def _query_topk_ids(
             SELECT {id_col} AS entity_id, distance
             FROM {table}
             WHERE embedding MATCH ?
+              AND k = ?
             ORDER BY distance
-            LIMIT ?
             """,
             (query_json, k),
         ).fetchall()
@@ -114,11 +114,11 @@ def _query_topk_ids(
             SELECT {id_col} AS entity_id, distance
             FROM {table}
             WHERE embedding MATCH ?
+              AND k = ?
               AND {id_col} IN ({placeholders})
             ORDER BY distance
-            LIMIT ?
             """,
-            (query_json, *chunk, k),
+            (query_json, k, *chunk),
         ).fetchall()
         out.extend((int(r["entity_id"]), float(r["distance"])) for r in rows)
 
