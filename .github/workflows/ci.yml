@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e .[all]
+          python3 -m pip install build
+
+      - name: Basic checks
+        run: |
+          python3 -m compileall -q src
+          python3 -c "import agent"
+          python3 -m build --sdist --wheel

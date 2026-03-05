@@ -141,6 +141,7 @@ class Settings:
     memory: MemorySettings
 
     workspace: str
+    trace_stdout: bool = True
 
     skills_enabled: List[str] = field(default_factory=list)
     tool_policy: ToolPolicySettings = field(default_factory=ToolPolicySettings)
@@ -153,6 +154,7 @@ class Settings:
 def load_settings() -> Settings:
     env = _env("APP_ENV", "dev")
     debug = _env("APP_DEBUG", "true").lower() == "true"
+    trace_stdout = _env_bool("TRACE_STDOUT", True)
 
     # ---- Database ----
     db_path = _env("DB_PATH", "agent.db")
@@ -228,6 +230,7 @@ def load_settings() -> Settings:
     settings = Settings(
         env=env,
         debug=debug,
+        trace_stdout=trace_stdout,
         db=db,
         llm=llm,
         embeddings=embeddings,
