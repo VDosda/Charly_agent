@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
@@ -23,7 +25,18 @@ from agent.core.tracing import JSONTracer, new_correlation_id
 from agent.core.tool_runtime import ToolRuntime
 from agent.core.planner import Planner, ToolPolicy
 from agent.memory.distill_mt import maybe_create_episode
-from agent.memory.distill_lt import maybe_distill_profile_from_episode
+from agent.memory.distill_lt import LTConfig, maybe_distill_profile_from_st_window, retry_pending_lt_embeddings
+
+
+@dataclass(frozen=True)
+class MemoryJob:
+    correlation_id: str
+    user_id: str
+    session_id: str
+    user_turn_id: int
+    assistant_turn_id: int
+    enqueued_at_ms: int
+    enqueued_perf_ts: float
 
 
 
@@ -73,6 +86,27 @@ class AgentRuntime:
             max_workers=4,
         )
         self.planner = Planner(policy=ToolPolicy.from_settings(settings))
+        self.lt_cfg = LTConfig(
+            min_importance=float(self.settings.memory.lt_importance_threshold),
+            min_confidence=float(self.settings.memory.lt_confidence_threshold),
+        )
+        self._memory_loop = asyncio.new_event_loop()
+        self._memory_queue: Optional[asyncio.Queue[Optional[MemoryJob]]] = None
+        self._memory_session_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+        self._memory_worker_ready = threading.Event()
+        self._memory_worker_thread = threading.Thread(
+            target=self._memory_worker_main,
+            name="agent-memory-worker",
+            daemon=True,
+        )
+        self._memory_worker_thread.start()
+        if not self._memory_worker_ready.wait(timeout=2.0):
+            self.tracer.emit(
+                event="memory.worker.init",
+                level="warning",
+                correlation_id="runtime-init",
+                payload={"status": "not_ready"},
+            )
 
     def handle_message(self, user_id: str, session_id: str, message: str) -> str:
         """
@@ -91,7 +125,7 @@ class AgentRuntime:
                     ↓
                 persist assistant answer
                     ↓
-                MT/LT hooks
+                enqueue memory job (background)
             """
 
         correlation_id = new_correlation_id()
@@ -106,7 +140,7 @@ class AgentRuntime:
         )
 
         # 1 Persist user message (ST)
-        self._persist_turn(
+        user_turn_id = self._persist_turn(
             user_id=user_id,
             session_id=session_id,
             role="user",
@@ -194,6 +228,7 @@ class AgentRuntime:
         # 4 Tool execution loop
         final_text = ""
         tool_iterations = 0
+        llm_main_start = time.perf_counter()
 
         while True:
 
@@ -265,35 +300,44 @@ class AgentRuntime:
             # Append tool feedback messages
             messages.extend(tool_msgs)
 
+        llm_main_latency_ms = int((time.perf_counter() - llm_main_start) * 1000)
+        self.tracer.emit(
+            event="llm.main.latency",
+            level="debug",
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            payload={"llm_main_latency": llm_main_latency_ms},
+        )
+
         # 5 Persist assistant answer
-        self._persist_turn(
+        assistant_turn_id = self._persist_turn(
             user_id=user_id,
             session_id=session_id,
             role="assistant",
             content=final_text,
         )
 
-        # 6 Memory hooks
-        self._maybe_create_episode(
+        memory_enqueued = self._enqueue_memory_job(
             correlation_id=correlation_id,
             user_id=user_id,
             session_id=session_id,
+            user_turn_id=user_turn_id,
+            assistant_turn_id=assistant_turn_id,
         )
 
-        self._maybe_distill_profile(user_id, session_id)
-
-
-        # 7 Cleanup
-        self._cleanup(user_id, session_id)
-
-        # 8 Tracing end
+        # 6 Tracing end (memory continues in background worker)
         self.tracer.emit(
             event="request.end",
             level="info",
             correlation_id=correlation_id,
             user_id=user_id,
             session_id=session_id,
-            payload={"response_len": len(final_text)},
+            payload={
+                "response_len": len(final_text),
+                "llm_main_latency": llm_main_latency_ms,
+                "memory_job_enqueued": bool(memory_enqueued),
+            },
         )
 
         return final_text
@@ -551,7 +595,7 @@ class AgentRuntime:
         tool_name: Optional[str] = None,
         tool_args_json: Optional[str] = None,
         tool_result_json: Optional[str] = None,
-    ) -> None:
+    ) -> int:
         """
         Insert one turn into chat_history.
 
@@ -588,6 +632,7 @@ class AgentRuntime:
                     tool_result_json,
                 ),
             )
+        return next_turn_id
 
     def _read_recent_turns(self, session_id: str, limit: int) -> List[Dict[str, Any]]:
         """
@@ -633,10 +678,22 @@ class AgentRuntime:
         return out
 
     # ---------------------------------------------------------------------
-    # MT/LT hooks (placeholders for next steps)
+    # MT/LT hooks (executed in background memory worker)
     # ---------------------------------------------------------------------
 
-    def _maybe_create_episode(self, correlation_id: str, user_id: str, session_id: str) -> None:
+    def _maybe_distill_lt_from_st(self, correlation_id: str, user_id: str, session_id: str) -> int:
+        return maybe_distill_profile_from_st_window(
+            db=self.db,
+            llm=self.llm,
+            embeddings=self.embeddings,
+            tracer=self.tracer,
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            cfg=self.lt_cfg,
+        )
+
+    def _maybe_create_episode(self, correlation_id: str, user_id: str, session_id: str) -> Dict[str, Any]:
         episode_id = maybe_create_episode(
             db=self.db,
             llm=self.llm,
@@ -646,30 +703,21 @@ class AgentRuntime:
             user_id=user_id,
             session_id=session_id,
         )
-        if episode_id:
-            maybe_distill_profile_from_episode(
-                db=self.db,
-                llm=self.llm,
-                embeddings=self.embeddings,
-                tracer=self.tracer,
-                correlation_id=correlation_id,
-                user_id=user_id,
-                session_id=session_id,
-                episode_id=episode_id,
-            )
-
-    def _maybe_distill_profile(self, user_id: str, session_id: str) -> None:
-        """
-        Hook: extract stable LT memories (preferences/facts/procedures) and upsert.
-
-        Implement once you have:
-        - profile_memory table
-        - upsert logic (fingerprint, supersede by key)
-        - retrieval logic (fts + vec) for future context building
-
-        For now: no-op.
-        """
-        return
+        retry_stats = retry_pending_lt_embeddings(
+            db=self.db,
+            embeddings=self.embeddings,
+            tracer=self.tracer,
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            limit=6,
+            force=False,
+        )
+        return {
+            "episode_id": episode_id,
+            "embedding_retry_count": int((retry_stats or {}).get("processed", 0)),
+            "embedding_retry_succeeded": int((retry_stats or {}).get("succeeded", 0)),
+        }
 
     def _cleanup(self, user_id: str, session_id: str) -> None:
         cleanup_st(self.db, session_id=session_id)
@@ -739,3 +787,178 @@ class AgentRuntime:
                 mt_chars = len(content)
 
         return lt_chars, mt_chars
+
+    # ---------------------------------------------------------------------
+    # Background memory worker
+    # ---------------------------------------------------------------------
+
+    def _memory_worker_main(self) -> None:
+        asyncio.set_event_loop(self._memory_loop)
+        self._memory_queue = asyncio.Queue()
+        self._memory_loop.create_task(self._memory_worker_loop())
+        self._memory_worker_ready.set()
+        self.tracer.emit(
+            event="memory.worker.init",
+            level="info",
+            correlation_id="runtime-init",
+            payload={"status": "ready"},
+        )
+        self._memory_loop.run_forever()
+
+    async def _memory_worker_loop(self) -> None:
+        if self._memory_queue is None:
+            return
+
+        while True:
+            job = await self._memory_queue.get()
+            if job is None:
+                self._memory_queue.task_done()
+                break
+
+            queue_delay_ms = int((time.perf_counter() - job.enqueued_perf_ts) * 1000)
+            self.tracer.emit(
+                event="memory.job.start",
+                level="debug",
+                correlation_id=job.correlation_id,
+                user_id=job.user_id,
+                session_id=job.session_id,
+                payload={
+                    "memory_job_queue_delay": queue_delay_ms,
+                    "user_turn_id": job.user_turn_id,
+                    "assistant_turn_id": job.assistant_turn_id,
+                },
+            )
+
+            started = time.perf_counter()
+            lt_items_written = 0
+            mt_episode_created = False
+            embedding_retry_count = 0
+
+            lock = self._memory_session_lock(job.user_id, job.session_id)
+            async with lock:
+                try:
+                    lt_items_written = int(
+                        self._maybe_distill_lt_from_st(
+                            correlation_id=job.correlation_id,
+                            user_id=job.user_id,
+                            session_id=job.session_id,
+                        )
+                    )
+                except Exception as e:
+                    self.tracer.emit(
+                        event="memory.job.step.error",
+                        level="warning",
+                        correlation_id=job.correlation_id,
+                        user_id=job.user_id,
+                        session_id=job.session_id,
+                        payload={"step": "lt_distill", "error": f"{type(e).__name__}: {e}"},
+                    )
+
+                try:
+                    mt_stats = self._maybe_create_episode(
+                        correlation_id=job.correlation_id,
+                        user_id=job.user_id,
+                        session_id=job.session_id,
+                    )
+                    mt_episode_created = bool((mt_stats or {}).get("episode_id"))
+                    embedding_retry_count = int((mt_stats or {}).get("embedding_retry_count", 0))
+                except Exception as e:
+                    self.tracer.emit(
+                        event="memory.job.step.error",
+                        level="warning",
+                        correlation_id=job.correlation_id,
+                        user_id=job.user_id,
+                        session_id=job.session_id,
+                        payload={"step": "mt_distill_and_retry", "error": f"{type(e).__name__}: {e}"},
+                    )
+
+                try:
+                    self._cleanup(job.user_id, job.session_id)
+                except Exception as e:
+                    self.tracer.emit(
+                        event="memory.job.step.error",
+                        level="warning",
+                        correlation_id=job.correlation_id,
+                        user_id=job.user_id,
+                        session_id=job.session_id,
+                        payload={"step": "st_cleanup", "error": f"{type(e).__name__}: {e}"},
+                    )
+
+            memory_job_duration_ms = int((time.perf_counter() - started) * 1000)
+            self.tracer.emit(
+                event="memory.job.end",
+                level="info",
+                correlation_id=job.correlation_id,
+                user_id=job.user_id,
+                session_id=job.session_id,
+                payload={
+                    "memory_job_queue_delay": queue_delay_ms,
+                    "memory_job_duration": memory_job_duration_ms,
+                    "lt_items_written": int(lt_items_written),
+                    "mt_episode_created": bool(mt_episode_created),
+                    "embedding_retry_count": int(embedding_retry_count),
+                },
+            )
+            self._memory_queue.task_done()
+
+    def _memory_session_lock(self, user_id: str, session_id: str) -> asyncio.Lock:
+        key = (user_id, session_id)
+        lock = self._memory_session_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._memory_session_locks[key] = lock
+        return lock
+
+    def _enqueue_memory_job(
+        self,
+        *,
+        correlation_id: str,
+        user_id: str,
+        session_id: str,
+        user_turn_id: int,
+        assistant_turn_id: int,
+    ) -> bool:
+        if not self._memory_worker_ready.is_set() or self._memory_queue is None:
+            self.tracer.emit(
+                event="memory.job.enqueue",
+                level="warning",
+                correlation_id=correlation_id,
+                user_id=user_id,
+                session_id=session_id,
+                payload={"status": "worker_not_ready"},
+            )
+            return False
+
+        job = MemoryJob(
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            user_turn_id=int(user_turn_id),
+            assistant_turn_id=int(assistant_turn_id),
+            enqueued_at_ms=int(time.time() * 1000),
+            enqueued_perf_ts=time.perf_counter(),
+        )
+        self._memory_loop.call_soon_threadsafe(self._memory_queue.put_nowait, job)
+        self.tracer.emit(
+            event="memory.job.enqueue",
+            level="debug",
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            payload={
+                "status": "queued",
+                "user_turn_id": int(user_turn_id),
+                "assistant_turn_id": int(assistant_turn_id),
+            },
+        )
+        return True
+
+    def wait_memory_idle(self, timeout_s: float = 5.0) -> bool:
+        if not self._memory_worker_ready.is_set() or self._memory_queue is None:
+            return True
+        fut = asyncio.run_coroutine_threadsafe(self._memory_queue.join(), self._memory_loop)
+        try:
+            fut.result(timeout=float(timeout_s))
+            return True
+        except Exception:
+            return False
