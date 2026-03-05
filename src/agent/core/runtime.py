@@ -65,7 +65,7 @@ class AgentRuntime:
             max_tool_iterations=6,
             max_history_turns=settings.memory.st_active_turns,
         )
-        self.tracer = JSONTracer(enabled=True)
+        self.tracer = JSONTracer(enabled=settings.trace_stdout)
         self.tool_runtime = ToolRuntime(
             registry=self.skills,
             tracer=self.tracer,
