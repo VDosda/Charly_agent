@@ -1,0 +1,13 @@
+{
+  "name": "charly-agent-dev",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:api": "./.venv/bin/uvicorn agent.app:create_api_app --factory --host 127.0.0.1 --port 8000 --reload",
+    "dev:web": "npm --prefix frontend run dev",
+    "dev": "concurrently -k -n api,web -c green,cyan \"npm run dev:api\" \"npm run dev:web\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
