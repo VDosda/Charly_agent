@@ -99,3 +99,6 @@ agent.db-wal
 
 workspace/*
 !workspace/.gitkeep
+
+# Local planning
+TODO.md
