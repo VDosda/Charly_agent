@@ -2,29 +2,37 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Agent Monitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Monitor Logs</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <header>
-    <h1>Agent Monitor</h1>
-    <div class="filters">
-      <input id="userId" placeholder="user_id (optional)" />
-      <input id="sessionId" placeholder="session_id (optional)" />
-      <button id="refreshBtn">Refresh</button>
-    </div>
+  <header class="topbar">
+    <h1>Agent Logs</h1>
   </header>
 
-  <main class="grid">
-    <section>
-      <h2>Recent requests (correlation_id)</h2>
-      <ul id="corrList"></ul>
+  <main class="layout">
+    <section class="panel controlsPanel">
+      <h2>Filtres</h2>
+      <div class="controlsGrid">
+        <input id="userId" placeholder="user_id (optionnel)" />
+        <input id="sessionId" placeholder="session_id (optionnel)" />
+        <input id="correlationId" placeholder="correlation_id (optionnel)" />
+        <input id="limit" type="number" min="1" max="1000" value="200" />
+      </div>
+      <div class="actions">
+        <button id="refreshBtn">Recharger</button>
+        <label class="check">
+          <input id="autoRefresh" type="checkbox" />
+          Auto-refresh (2s)
+        </label>
+      </div>
     </section>
 
-    <section>
-      <h2>Timeline</h2>
-      <div id="timelineMeta" class="muted"></div>
-      <pre id="timeline"></pre>
+    <section class="panel logsPanel">
+      <h2>Onglet Log</h2>
+      <div id="logsMeta" class="muted">Aucun log chargé.</div>
+      <div id="logs" class="logs" aria-live="polite"></div>
     </section>
   </main>
 
