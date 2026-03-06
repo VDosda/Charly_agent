@@ -8,12 +8,15 @@ from typing import Any, Dict, List, Optional, Sequence
 import sqlite3
 
 from agent.core.tracing import JSONTracer
-from agent.memory.scoring import distance_to_similarity
+from agent.memory.memory_manager import (
+    MemoryIntent,
+    MemoryManager,
+    MemoryManagerConfig,
+)
 from agent.memory.store_lt import (
     list_embedding_retry_candidates,
     mark_embedding_retry_failure,
     mark_embedding_retry_success,
-    upsert_memory_item,
 )
 from agent.memory.vector_store import query_topk_item_ids, upsert_item_vec
 from agent.providers.embeddings.base import EmbeddingProvider
@@ -205,7 +208,6 @@ def _distill_lt_from_st_window(
         return 0
 
     st_turn_ids = {int(t["turn_id"]) for t in st_turns}
-    existing_index = _read_existing_memory_index(db, user_id=user_id)
     prompts = _lt_messages(
         st_turns=st_turns,
         mt_payload=mt_payload or {},
@@ -240,7 +242,7 @@ def _distill_lt_from_st_window(
         tools=None,
         tool_choice="none",
     )
-    items = _parse_items_json(res.text)
+    intents = _parse_intents_json(res.text)
     tracer.emit(
         event="lt.llm.response",
         level="debug",
@@ -253,11 +255,11 @@ def _distill_lt_from_st_window(
             "raw_response_chars": len((res.text or "").strip()),
             "raw_response_preview": _truncate_for_trace((res.text or "").strip()),
             "raw_response_preview_truncated": len((res.text or "").strip()) > 4000,
-            "parsed_items": len(items),
+            "parsed_items": len(intents),
         },
     )
 
-    if not items:
+    if not intents:
         tracer.emit(
             event="lt.distill.skip",
             level="debug",
@@ -272,23 +274,29 @@ def _distill_lt_from_st_window(
         )
         return 0
 
+    manager = MemoryManager(
+        db=db,
+        embeddings=embeddings,
+        tracer=tracer,
+        cfg=MemoryManagerConfig(
+            min_importance=cfg.min_importance,
+            min_confidence=cfg.min_confidence,
+            semantic_dedupe_top_k=cfg.semantic_dedupe_top_k,
+            semantic_dedupe_min_similarity=cfg.semantic_dedupe_min_similarity,
+        ),
+        # Keep this dependency injection explicit so tests can patch
+        # `agent.memory.distill_lt.query_topk_item_ids`.
+        semantic_query_fn=query_topk_item_ids,
+    )
+
     upserted = 0
     inserted = 0
     updated = 0
+    archived = 0
     skipped = 0
 
-    for it in items[: cfg.max_items]:
-        kind = str(it.get("kind") or "").strip()
-        mem_key = it.get("key")
-        mem_key = str(mem_key).strip() if mem_key is not None else None
-        if mem_key == "":
-            mem_key = None
-        value = str(it.get("value") or "").strip()
-        confidence = _clamp01(_to_float(it.get("confidence"), 0.6))
-        importance = _clamp01(_to_float(it.get("importance"), 0.5))
-        evidence_span = str(it.get("evidence_span") or "").strip()
-        source_turn_ids = _coerce_int_list(it.get("source_turn_ids"))
-        valid_source_turn_ids = [tid for tid in source_turn_ids if tid in st_turn_ids]
+    for intent in intents[: cfg.max_items]:
+        key_hint = str((intent.attributes or {}).get("key_hint") or "").strip() or None
 
         tracer.emit(
             event="lt.item.candidate",
@@ -299,27 +307,32 @@ def _distill_lt_from_st_window(
             payload={
                 "mode": mode,
                 "episode_id": episode_id_for_trace,
-                "kind": kind,
-                "mem_key": mem_key,
-                "value_chars": len(value),
-                "confidence": confidence,
-                "importance": importance,
-                "evidence_chars": len(evidence_span),
-                "source_turn_ids": valid_source_turn_ids,
+                "action": intent.action,
+                "entity_type": intent.entity_type,
+                "entity_name": intent.entity_name,
+                "kind": intent.entity_type,
+                "mem_key_hint": key_hint,
+                "description_chars": len(intent.description or ""),
+                "confidence": intent.confidence,
+                "importance": intent.importance,
+                "evidence_chars": len(intent.evidence_span or ""),
+                "source_turn_ids": intent.source_turn_ids,
             },
         )
 
-        skip_reason = _item_skip_reason(
-            kind=kind,
-            value=value,
-            importance=importance,
-            min_importance=cfg.min_importance,
-            confidence=confidence,
-            min_confidence=cfg.min_confidence,
-            evidence_span=evidence_span,
-            valid_source_turn_ids=valid_source_turn_ids,
+        result = manager.process_intent(
+            correlation_id=correlation_id,
+            user_id=user_id,
+            session_id=session_id,
+            intent=intent,
+            st_turn_ids=st_turn_ids,
+            source_episode_id=source_episode_id,
+            source_note=source_note,
+            mode=mode,
+            episode_id_for_trace=episode_id_for_trace,
         )
-        if skip_reason:
+
+        if not result.applied:
             skipped += 1
             tracer.emit(
                 event="lt.item.skip",
@@ -330,128 +343,24 @@ def _distill_lt_from_st_window(
                 payload={
                     "mode": mode,
                     "episode_id": episode_id_for_trace,
-                    "reason": skip_reason,
-                    "kind": kind,
-                    "mem_key": mem_key,
-                    "importance": importance,
-                    "confidence": confidence,
-                    "evidence_chars": len(evidence_span),
-                    "source_turn_ids": valid_source_turn_ids,
+                    "reason": result.skip_reason,
+                    "action": intent.action,
+                    "kind": result.kind or intent.entity_type,
+                    "mem_key_hint": key_hint,
+                    "importance": intent.importance,
+                    "confidence": intent.confidence,
+                    "evidence_chars": len(intent.evidence_span or ""),
+                    "source_turn_ids": intent.source_turn_ids,
                 },
             )
             continue
 
-        source_turn_ids_json = json.dumps(valid_source_turn_ids, ensure_ascii=False)
-        emb_status = "ready"
-        emb_error = None
-        emb_retry_count = 0
-        emb_last_attempt_ts = int(time.time())
-        emb_next_retry_ts = None
-
-        vec: List[float] = []
-        emb_blob = None
-        emb_model = None
-        emb_dims = None
-        try:
-            emb = embeddings.embed(
-                [f"{kind}: {mem_key or ''} {value}\nEvidence: {evidence_span}".strip()]
-            )
-            vec = emb.vectors[0] if emb.vectors else []
-            emb_model = emb.model
-            emb_dims = emb.dimensions
-            emb_blob = pack_f32(vec) if vec else None
-            if not vec:
-                emb_status = "pending"
-                emb_error = "Embedding provider returned an empty vector"
-                emb_next_retry_ts = emb_last_attempt_ts + _retry_delay_seconds(0)
-        except Exception as e:
-            emb_status = "pending"
-            emb_error = f"{type(e).__name__}: {e}"
-            emb_next_retry_ts = emb_last_attempt_ts + _retry_delay_seconds(0)
-            tracer.emit(
-                event="lt.embed.error",
-                level="warning",
-                correlation_id=correlation_id,
-                user_id=user_id,
-                session_id=session_id,
-                payload={"mode": mode, "episode_id": episode_id_for_trace, "error": emb_error},
-            )
-
-        semantic_match: Optional[Dict[str, Any]] = None
-        mem_key_for_upsert = mem_key
-        target_item_id: Optional[int] = None
-
-        if vec:
-            semantic_match = _find_semantic_duplicate(
-                db=db,
-                user_id=user_id,
-                kind=kind,
-                mem_key=mem_key,
-                value=value,
-                vec=vec,
-                cfg=cfg,
-                existing_index=existing_index,
-            )
-
-        if semantic_match:
-            match_item_id = int(semantic_match["item_id"])
-            match_mem_key = semantic_match.get("mem_key")
-            match_similarity = float(semantic_match.get("similarity", 0.0))
-            match_distance = float(semantic_match.get("distance", 0.0))
-
-            # Prefer canonical existing mem_key when available.
-            if match_mem_key is not None and str(match_mem_key).strip():
-                mem_key_for_upsert = str(match_mem_key).strip()
-            else:
-                target_item_id = match_item_id
-
-            tracer.emit(
-                event="lt.item.semantic_merge",
-                level="debug",
-                correlation_id=correlation_id,
-                user_id=user_id,
-                session_id=session_id,
-                payload={
-                    "mode": mode,
-                    "episode_id": episode_id_for_trace,
-                    "match_item_id": match_item_id,
-                    "match_mem_key": match_mem_key,
-                    "match_similarity": match_similarity,
-                    "match_distance": match_distance,
-                    "candidate_mem_key": mem_key,
-                    "resolved_mem_key": mem_key_for_upsert,
-                    "target_item_id": target_item_id,
-                },
-            )
-
-        upsert_result = upsert_memory_item(
-            db,
-            user_id=user_id,
-            kind=kind,
-            mem_key=mem_key_for_upsert,
-            value=value,
-            confidence=confidence,
-            importance=importance,
-            source_session_id=session_id,
-            source_episode_id=source_episode_id,
-            source_note=source_note,
-            evidence_span=evidence_span,
-            source_turn_ids_json=source_turn_ids_json,
-            embedding_model=emb_model,
-            embedding_dims=emb_dims,
-            embedding_blob=emb_blob,
-            embedding_status=emb_status,
-            last_embedding_error=emb_error,
-            embedding_retry_count=emb_retry_count,
-            embedding_last_attempt_ts=emb_last_attempt_ts,
-            embedding_next_retry_ts=emb_next_retry_ts,
-            target_item_id=target_item_id,
-        )
-
-        if upsert_result.action == "inserted":
+        if result.action == "inserted":
             inserted += 1
-        elif upsert_result.action == "updated":
+        elif result.action == "updated":
             updated += 1
+        elif result.action == "archived":
+            archived += 1
 
         tracer.emit(
             event="lt.item.upsert",
@@ -462,42 +371,16 @@ def _distill_lt_from_st_window(
             payload={
                 "mode": mode,
                 "episode_id": episode_id_for_trace,
-                "item_id": upsert_result.item_id,
-                "action": upsert_result.action,
-                "kind": kind,
-                "mem_key": mem_key,
-                "confidence": confidence,
-                "importance": importance,
-                "source_turn_ids": valid_source_turn_ids,
-                "embedding_status": emb_status,
+                "item_id": result.item_id,
+                "action": result.action,
+                "kind": result.kind or intent.entity_type,
+                "mem_key": result.mem_key,
+                "confidence": intent.confidence,
+                "importance": intent.importance,
+                "source_turn_ids": intent.source_turn_ids,
+                "embedding_status": result.embedding_status,
             },
         )
-
-        if vec:
-            try:
-                upsert_item_vec(db, upsert_result.item_id, vec)
-                tracer.emit(
-                    event="lt.item.vec.upsert",
-                    level="debug",
-                    correlation_id=correlation_id,
-                    user_id=user_id,
-                    session_id=session_id,
-                    payload={
-                        "mode": mode,
-                        "episode_id": episode_id_for_trace,
-                        "item_id": upsert_result.item_id,
-                        "embedding_dims": int(len(vec)),
-                    },
-                )
-            except Exception as e:
-                tracer.emit(
-                    event="lt.vec.upsert.error",
-                    level="warning",
-                    correlation_id=correlation_id,
-                    user_id=user_id,
-                    session_id=session_id,
-                    payload={"item_id": upsert_result.item_id, "error": f"{type(e).__name__}: {e}"},
-                )
         upserted += 1
 
     tracer.emit(
@@ -512,8 +395,9 @@ def _distill_lt_from_st_window(
             "upserted": upserted,
             "inserted": inserted,
             "updated": updated,
+            "archived": archived,
             "skipped": skipped,
-            "considered": min(len(items), cfg.max_items),
+            "considered": min(len(intents), cfg.max_items),
             "max_items": cfg.max_items,
             "min_importance": cfg.min_importance,
             "min_confidence": cfg.min_confidence,
@@ -662,15 +546,17 @@ def _lt_messages(
     st_ids = [int(t["turn_id"]) for t in st_turns]
     st_transcript = _render_st_transcript(st_turns, max_chars_per_turn=max_chars_per_turn)
     system = (
-        "You extract LONG-TERM memory items for an agent.\n"
+        "You extract LONG-TERM memory intents for an agent.\n"
         "SOURCE OF TRUTH: ST transcript below.\n"
         "MT summary is optional context only (prioritization, dedupe).\n"
         "Return STRICT JSON only. No markdown.\n"
         "Return an array with schema:\n"
         "{\n"
-        '  "kind": "identity"|"preference"|"constraint"|"goal"|"procedure"|"project",\n'
-        '  "key": string|null,\n'
-        '  "value": string,\n'
+        '  "action": "create"|"update"|"archive"|"none",\n'
+        '  "entity_type": "identity"|"preference"|"constraint"|"goal"|"procedure"|"project"|"other",\n'
+        '  "entity_name": string,\n'
+        '  "description": string,\n'
+        '  "attributes": object,\n'
         '  "confidence": number,\n'
         '  "importance": number,\n'
         '  "evidence_span": string,\n'
@@ -679,11 +565,15 @@ def _lt_messages(
         f"Max items: {max_items}.\n"
         f"Minimum confidence guidance: {min_confidence:.2f}.\n"
         "Rules:\n"
-        "- Only durable facts/preferences/constraints/procedures.\n"
+        "- Only durable facts/preferences/constraints/procedures/projects.\n"
         "- Evidence is mandatory for every item.\n"
         "- source_turn_ids MUST reference turn ids present in ST transcript.\n"
-        "- If no evidence in ST for an item, do not output it.\n"
-        "- Keep values canonical and concise.\n"
+        "- If no evidence in ST for an intent, do not output it.\n"
+        "- The LLM must not define final mem_key. Use attributes only as hints.\n"
+        "- `entity_name` and `attributes.canonical_value_en` MUST be canonical English.\n"
+        "- For project lifecycle updates, include `attributes.status` in English (active/abandoned/etc.).\n"
+        "- For archive action, describe what should be archived in description/attributes.\n"
+        "- If no durable memory intent exists, return an empty array.\n"
     )
     user = (
         "ST transcript (ground truth):\n"
@@ -868,103 +758,6 @@ def _read_latest_mt_payload(db: sqlite3.Connection, *, session_id: str) -> Optio
     }
 
 
-def _read_existing_memory_index(db: sqlite3.Connection, *, user_id: str) -> Dict[str, Any]:
-    rows = db.execute(
-        """
-        SELECT id, kind, mem_key
-        FROM memory_items
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    ).fetchall()
-
-    by_id: Dict[int, Dict[str, Any]] = {}
-    ids_by_kind: Dict[str, List[int]] = {}
-    id_by_kind_key: Dict[tuple[str, str], int] = {}
-
-    for r in rows:
-        item_id = int(r["id"])
-        kind = str(r["kind"] or "").strip()
-        mem_key = r["mem_key"]
-        mem_key_norm = str(mem_key).strip() if mem_key is not None else None
-        if mem_key_norm == "":
-            mem_key_norm = None
-
-        by_id[item_id] = {"id": item_id, "kind": kind, "mem_key": mem_key_norm}
-        ids_by_kind.setdefault(kind, []).append(item_id)
-        if mem_key_norm is not None:
-            id_by_kind_key[(kind, mem_key_norm)] = item_id
-
-    return {
-        "by_id": by_id,
-        "ids_by_kind": ids_by_kind,
-        "id_by_kind_key": id_by_kind_key,
-    }
-
-
-def _find_semantic_duplicate(
-    *,
-    db: sqlite3.Connection,
-    user_id: str,
-    kind: str,
-    mem_key: Optional[str],
-    value: str,
-    vec: Sequence[float],
-    cfg: LTConfig,
-    existing_index: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    if not vec:
-        return None
-
-    mem_key_norm = str(mem_key).strip() if mem_key is not None else None
-    if mem_key_norm == "":
-        mem_key_norm = None
-
-    # Exact key already handled by deterministic key-upsert.
-    if mem_key_norm is not None and (kind, mem_key_norm) in existing_index.get("id_by_kind_key", {}):
-        return None
-
-    allowed_ids = list(existing_index.get("ids_by_kind", {}).get(kind, []))
-    if not allowed_ids:
-        return None
-
-    try:
-        neighbors = query_topk_item_ids(
-            db,
-            list(vec),
-            k=max(1, int(cfg.semantic_dedupe_top_k)),
-            allowed_ids=allowed_ids,
-        )
-    except Exception:
-        # If vec table is unavailable, semantic dedupe is skipped gracefully.
-        return None
-
-    by_id = existing_index.get("by_id", {})
-    for item_id, distance in neighbors:
-        item = by_id.get(int(item_id))
-        if not item:
-            continue
-
-        similarity = distance_to_similarity(float(distance))
-        if similarity < float(cfg.semantic_dedupe_min_similarity):
-            continue
-
-        existing_mem_key = item.get("mem_key")
-        if mem_key_norm is not None and existing_mem_key is not None and mem_key_norm == existing_mem_key:
-            # This case should already be captured by key-upsert path.
-            continue
-
-        return {
-            "item_id": int(item_id),
-            "mem_key": existing_mem_key,
-            "similarity": float(similarity),
-            "distance": float(distance),
-            "candidate_value_chars": len(value),
-        }
-
-    return None
-
-
 def _render_st_transcript(turns: Sequence[Dict[str, Any]], *, max_chars_per_turn: int) -> str:
     lines: List[str] = []
     for t in turns:
@@ -981,31 +774,14 @@ def _render_st_transcript(turns: Sequence[Dict[str, Any]], *, max_chars_per_turn
     return "\n".join(lines)
 
 
-def _item_skip_reason(
-    *,
-    kind: str,
-    value: str,
-    importance: float,
-    min_importance: float,
-    confidence: float,
-    min_confidence: float,
-    evidence_span: str,
-    valid_source_turn_ids: Sequence[int],
-) -> Optional[str]:
-    if not kind or not value:
-        return "missing_kind_or_value"
-    if not evidence_span:
-        return "missing_evidence_span"
-    if not valid_source_turn_ids:
-        return "missing_source_turn_ids"
-    if importance < min_importance:
-        return "importance_below_threshold"
-    if confidence < min_confidence:
-        return "confidence_below_threshold"
-    return None
+def _parse_intents_json(text: str) -> List[MemoryIntent]:
+    """
+    Parse intents from strict JSON and coerce each object into MemoryIntent.
 
-
-def _parse_items_json(text: str) -> List[Dict[str, Any]]:
+    Backward compatibility:
+    - legacy item schema {"kind","key","value",...} is mapped to
+      action="create" intent with attributes.key_hint/value.
+    """
     if not text:
         return []
     s = text.strip()
@@ -1015,9 +791,71 @@ def _parse_items_json(text: str) -> List[Dict[str, Any]]:
         s = s[start : end + 1]
     try:
         obj = json.loads(s)
-        return obj if isinstance(obj, list) else []
     except Exception:
         return []
+    if not isinstance(obj, list):
+        return []
+
+    intents: List[MemoryIntent] = []
+    for raw in obj:
+        intent = _coerce_memory_intent(raw)
+        if intent is None:
+            continue
+        intents.append(intent)
+    return intents
+
+
+def _coerce_memory_intent(raw: Any) -> Optional[MemoryIntent]:
+    if not isinstance(raw, dict):
+        return None
+
+    action = str(raw.get("action") or "").strip().lower()
+    entity_type = str(raw.get("entity_type") or "").strip().lower()
+    entity_name = str(raw.get("entity_name") or "").strip()
+    description = str(raw.get("description") or "").strip()
+    attributes = raw.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = {}
+
+    # Legacy schema fallback.
+    if not action:
+        action = "create"
+    if not entity_type:
+        entity_type = str(raw.get("kind") or "").strip().lower()
+    if not entity_name:
+        entity_name = (
+            str(attributes.get("entity_name") or "").strip()
+            or str(attributes.get("name") or "").strip()
+            or str(raw.get("key") or "").strip()
+        )
+    if not description:
+        description = str(raw.get("value") or "").strip()
+
+    if raw.get("key") is not None and "key_hint" not in attributes:
+        key_hint = str(raw.get("key") or "").strip()
+        if key_hint:
+            attributes["key_hint"] = key_hint
+    if raw.get("value") is not None and "value" not in attributes:
+        value_hint = str(raw.get("value") or "").strip()
+        if value_hint:
+            attributes["value"] = value_hint
+
+    confidence = _clamp01(_to_float(raw.get("confidence"), 0.6))
+    importance = _clamp01(_to_float(raw.get("importance"), 0.5))
+    evidence_span = str(raw.get("evidence_span") or "").strip()
+    source_turn_ids = _coerce_int_list(raw.get("source_turn_ids"))
+
+    return MemoryIntent(
+        action=action,
+        entity_type=entity_type,
+        entity_name=entity_name,
+        description=description,
+        attributes=attributes,
+        evidence_span=evidence_span,
+        source_turn_ids=source_turn_ids,
+        confidence=confidence,
+        importance=importance,
+    )
 
 
 def _safe_load_json(s: Optional[str]) -> Any:

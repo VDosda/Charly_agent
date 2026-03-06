@@ -44,18 +44,37 @@ def retrieve_lt_items(
     user_id: str,
     limit: int = 8,
     min_importance: float = 0.5,
+    mode: str = "active",
 ) -> List[Dict[str, Any]]:
-    rows = db.execute(
-        """
-        SELECT id, kind, mem_key, value, confidence, importance, ts_updated
-        FROM memory_items
-        WHERE user_id = ?
-          AND importance >= ?
-        ORDER BY importance DESC, ts_updated DESC
-        LIMIT ?
-        """,
-        (user_id, float(min_importance), int(limit)),
-    ).fetchall()
+    where_mode = _mode_sql(mode)
+    try:
+        rows = db.execute(
+            f"""
+            SELECT id, kind, mem_key, value, confidence, importance, ts_updated
+            FROM memory_items
+            WHERE user_id = ?
+              AND importance >= ?
+              AND {where_mode}
+            ORDER BY importance DESC, ts_updated DESC
+            LIMIT ?
+            """,
+            (user_id, float(min_importance), int(limit)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Backward-compat when archived column is not present.
+        if mode == "archive":
+            return []
+        rows = db.execute(
+            """
+            SELECT id, kind, mem_key, value, confidence, importance, ts_updated
+            FROM memory_items
+            WHERE user_id = ?
+              AND importance >= ?
+            ORDER BY importance DESC, ts_updated DESC
+            LIMIT ?
+            """,
+            (user_id, float(min_importance), int(limit)),
+        ).fetchall()
 
     out: List[Dict[str, Any]] = []
     for r in rows:
@@ -71,6 +90,17 @@ def retrieve_lt_items(
             }
         )
     return out
+
+
+def _mode_sql(mode: str) -> str:
+    normalized = (mode or "active").strip().lower()
+    if normalized == "active":
+        return "archived = 0"
+    if normalized == "archive":
+        return "archived = 1"
+    if normalized == "all":
+        return "1=1"
+    raise ValueError(f"Unsupported LT retrieval mode: {mode}")
 
 
 def render_lt_block(items: List[Dict[str, Any]]) -> str:

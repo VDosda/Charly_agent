@@ -24,6 +24,7 @@ MIGRATIONS = [
     "0001_init.sql",
     "0002_mt_episodes.sql",
     "0003_lt_memory_items.sql",
+    "0005_lt_archive_flags.sql",
 ]
 
 

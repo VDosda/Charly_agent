@@ -82,12 +82,13 @@ def retrieve_lt_smart(
     user_id: str,
     user_message: str,
     limit: int = 6,
+    mode: str = "active",
 ) -> List[Tuple[MemoryItem, float]]:
     qv = embed_query(embeddings, user_message)
     if not qv:
         return []
 
-    scoped_item_ids = _read_scoped_item_ids(db, user_id=user_id)
+    scoped_item_ids = _read_scoped_item_ids(db, user_id=user_id, mode=mode)
     if not scoped_item_ids:
         return []
 
@@ -97,19 +98,38 @@ def retrieve_lt_smart(
         return []
 
     ids = [item_id for item_id, _ in candidates]
-    rows = db.execute(
-        f"""
-        SELECT
-            id, user_id, kind, mem_key, value,
-            ts_created, ts_updated, last_seen_ts,
-            importance, confidence,
-            source_session_id, source_episode_id, source_note
-        FROM memory_items
-        WHERE user_id = ?
-          AND id IN ({",".join("?" for _ in ids)})
-        """,
-        (user_id, *ids),
-    ).fetchall()
+    where_mode = _mode_sql(mode)
+    try:
+        rows = db.execute(
+            f"""
+            SELECT
+                id, user_id, kind, mem_key, value,
+                ts_created, ts_updated, last_seen_ts,
+                importance, confidence,
+                source_session_id, source_episode_id, source_note
+            FROM memory_items
+            WHERE user_id = ?
+              AND id IN ({",".join("?" for _ in ids)})
+              AND {where_mode}
+            """,
+            (user_id, *ids),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        if mode == "archive":
+            return []
+        rows = db.execute(
+            f"""
+            SELECT
+                id, user_id, kind, mem_key, value,
+                ts_created, ts_updated, last_seen_ts,
+                importance, confidence,
+                source_session_id, source_episode_id, source_note
+            FROM memory_items
+            WHERE user_id = ?
+              AND id IN ({",".join("?" for _ in ids)})
+            """,
+            (user_id, *ids),
+        ).fetchall()
 
     by_id = {int(r["id"]): r for r in rows}
 
@@ -194,13 +214,39 @@ def _read_scoped_item_ids(
     db: sqlite3.Connection,
     *,
     user_id: str,
+    mode: str = "active",
 ) -> List[int]:
-    rows = db.execute(
-        """
-        SELECT id
-        FROM memory_items
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    ).fetchall()
+    where_mode = _mode_sql(mode)
+    try:
+        rows = db.execute(
+            f"""
+            SELECT id
+            FROM memory_items
+            WHERE user_id = ? AND {where_mode}
+            """,
+            (user_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Backward-compat fallback for databases without archive columns.
+        if mode == "archive":
+            return []
+        rows = db.execute(
+            """
+            SELECT id
+            FROM memory_items
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchall()
     return [int(r["id"]) for r in rows]
+
+
+def _mode_sql(mode: str) -> str:
+    normalized = (mode or "active").strip().lower()
+    if normalized == "active":
+        return "archived = 0"
+    if normalized == "archive":
+        return "archived = 1"
+    if normalized == "all":
+        return "1=1"
+    raise ValueError(f"Unsupported LT retrieval mode: {mode}")

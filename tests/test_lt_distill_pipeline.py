@@ -14,6 +14,7 @@ from agent.memory.distill_lt import (
     retry_pending_lt_embeddings,
 )
 from agent.memory.distill_mt import maybe_create_episode
+from agent.memory.retrieve import retrieve_lt_items
 from agent.memory.store_lt import upsert_memory_item
 from agent.memory.store_mt import insert_episode
 from agent.providers.embeddings.base import EmbeddingResult
@@ -24,6 +25,7 @@ MIGRATIONS = [
     "0001_init.sql",
     "0002_mt_episodes.sql",
     "0003_lt_memory_items.sql",
+    "0005_lt_archive_flags.sql",
 ]
 
 
@@ -168,6 +170,167 @@ def seed_episode(
 
 
 class LTMemoryPipelineTests(unittest.TestCase):
+    def test_structured_intent_create_uses_manager_key_normalization(self):
+        conn = make_test_db()
+        tracer = CapturingTracer()
+        user = "u_intent_1"
+        session = "s_intent_1"
+        cfg = LTConfig(min_importance=0.5, min_confidence=0.6, min_st_turns=1, max_st_turns=80)
+
+        conn.execute(
+            """
+            INSERT INTO chat_history(
+              user_id, session_id, turn_id, ts, role, content,
+              tool_name, tool_args_json, tool_result_json, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0)
+            """,
+            (
+                user,
+                session,
+                1,
+                1_700_100_010,
+                "user",
+                "Please always answer in French.",
+            ),
+        )
+        conn.commit()
+
+        llm = StaticLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "action": "create",
+                            "entity_type": "preference",
+                            "entity_name": "language",
+                            "description": "User prefers French answers",
+                            "attributes": {
+                                "canonical_value_en": "Preferred language is French",
+                            },
+                            "confidence": 0.94,
+                            "importance": 0.88,
+                            "evidence_span": "Please always answer in French.",
+                            "source_turn_ids": [1],
+                        }
+                    ]
+                )
+            ]
+        )
+
+        upserted = maybe_distill_profile_from_st_window(
+            db=conn,
+            llm=llm,
+            embeddings=StableEmbeddings(),
+            tracer=tracer,
+            correlation_id="c-intent-1",
+            user_id=user,
+            session_id=session,
+            cfg=cfg,
+            include_latest_mt_context=False,
+        )
+        self.assertEqual(upserted, 1)
+
+        row = conn.execute(
+            """
+            SELECT kind, mem_key, value
+            FROM memory_items
+            WHERE user_id = ? AND kind = 'preference'
+            """,
+            (user,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["mem_key"], "preference.language")
+        self.assertEqual(row["value"], "Preferred language is French")
+
+    def test_archive_intent_marks_item_archived_and_retrieval_filters_it(self):
+        conn = make_test_db()
+        tracer = CapturingTracer()
+        user = "u_arch_1"
+        session = "s_arch_1"
+        cfg = LTConfig(min_importance=0.5, min_confidence=0.6, min_st_turns=1, max_st_turns=80)
+
+        upsert_memory_item(
+            conn,
+            user_id=user,
+            kind="project",
+            mem_key="project.project_x",
+            value="Project X roadmap",
+            confidence=0.9,
+            importance=0.9,
+            source_session_id=session,
+            source_note="seed",
+            evidence_span="I am working on project X",
+            source_turn_ids_json=json.dumps([1]),
+            embedding_status="ready",
+        )
+
+        conn.execute(
+            """
+            INSERT INTO chat_history(
+              user_id, session_id, turn_id, ts, role, content,
+              tool_name, tool_args_json, tool_result_json, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0)
+            """,
+            (user, session, 1, 1_700_200_010, "user", "I am dropping project X."),
+        )
+        conn.commit()
+
+        llm = StaticLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "action": "archive",
+                            "entity_type": "project",
+                            "entity_name": "project_x",
+                            "description": "Archive abandoned project X",
+                            "attributes": {
+                                "status": "abandoned",
+                                "archive_reason": "user request",
+                            },
+                            "confidence": 0.95,
+                            "importance": 0.9,
+                            "evidence_span": "I am dropping project X.",
+                            "source_turn_ids": [1],
+                        }
+                    ]
+                )
+            ]
+        )
+
+        upserted = maybe_distill_profile_from_st_window(
+            db=conn,
+            llm=llm,
+            embeddings=StableEmbeddings(),
+            tracer=tracer,
+            correlation_id="c-arch-1",
+            user_id=user,
+            session_id=session,
+            cfg=cfg,
+            include_latest_mt_context=False,
+        )
+        self.assertEqual(upserted, 1)
+
+        row = conn.execute(
+            """
+            SELECT archived, archived_reason
+            FROM memory_items
+            WHERE user_id = ? AND kind = 'project' AND mem_key = 'project.project_x'
+            """,
+            (user,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(int(row["archived"]), 1)
+        self.assertEqual(row["archived_reason"], "user request")
+
+        active = retrieve_lt_items(conn, user_id=user, mode="active", limit=10, min_importance=0.0)
+        archived = retrieve_lt_items(conn, user_id=user, mode="archive", limit=10, min_importance=0.0)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["mem_key"], "project.project_x.status")
+        self.assertEqual(len(archived), 1)
+
     def test_upsert_update_preserves_previous_version(self):
         conn = make_test_db()
 
@@ -255,7 +418,7 @@ class LTMemoryPipelineTests(unittest.TestCase):
             conn,
             user_id=user,
             kind="procedure",
-            mem_key="user_uses_grafana",
+            mem_key="procedure.user_uses_grafana",
             value="user uses grafana",
             confidence=0.9,
             importance=0.9,
@@ -299,18 +462,23 @@ class LTMemoryPipelineTests(unittest.TestCase):
 
         self.assertEqual(upserted, 1)
         count = conn.execute("SELECT COUNT(*) FROM memory_items WHERE user_id = ?", (user,)).fetchone()[0]
-        self.assertEqual(count, 1, "semantic duplicate should update existing row, not insert new one")
+        active_count = conn.execute(
+            "SELECT COUNT(*) FROM memory_items WHERE user_id = ? AND archived = 0",
+            (user,),
+        ).fetchone()[0]
+        self.assertEqual(active_count, 1, "semantic duplicate should keep one active canonical row")
 
         row = conn.execute(
             """
-            SELECT mem_key, value
+            SELECT mem_key, value, archived
             FROM memory_items
-            WHERE id = ?
+            WHERE user_id = ? AND archived = 0
             """,
-            (existing.item_id,),
+            (user,),
         ).fetchone()
-        self.assertEqual(row["mem_key"], "user_uses_grafana")
+        self.assertEqual(row["mem_key"], "procedure.user_uses_grafana")
         self.assertEqual(row["value"], "grafana monitoring")
+        self.assertEqual(int(row["archived"]), 0)
 
         merge_events = [e for e in tracer.events if e["event"] == "lt.item.semantic_merge"]
         self.assertGreaterEqual(len(merge_events), 1)
@@ -375,7 +543,7 @@ class LTMemoryPipelineTests(unittest.TestCase):
             """
             SELECT source_episode_id, source_note, evidence_span, source_turn_ids_json
             FROM memory_items
-            WHERE user_id = ? AND kind = 'preference' AND mem_key = 'language'
+            WHERE user_id = ? AND kind = 'preference' AND mem_key = 'preference.language'
             """,
             (user,),
         ).fetchone()
@@ -587,7 +755,7 @@ class LTMemoryPipelineTests(unittest.TestCase):
 
         row = conn.execute(
             "SELECT value FROM memory_items WHERE user_id = ? AND kind = ? AND mem_key = ?",
-            (user, "preference", "pref_3"),
+            (user, "preference", "preference.pref_3"),
         ).fetchone()
         self.assertEqual(row["value"], "value_3_updated")
 
@@ -722,7 +890,7 @@ class LTMemoryPipelineTests(unittest.TestCase):
             """
             SELECT embedding_status, last_embedding_error, embedding_retry_count
             FROM memory_items
-            WHERE user_id = ? AND kind = 'goal' AND mem_key = 'g1'
+            WHERE user_id = ? AND kind = 'goal' AND mem_key = 'goal.g1'
             """,
             (user,),
         ).fetchone()
@@ -746,7 +914,7 @@ class LTMemoryPipelineTests(unittest.TestCase):
             """
             SELECT embedding_status, last_embedding_error, embedding_dims, embedding_blob
             FROM memory_items
-            WHERE user_id = ? AND kind = 'goal' AND mem_key = 'g1'
+            WHERE user_id = ? AND kind = 'goal' AND mem_key = 'goal.g1'
             """,
             (user,),
         ).fetchone()
@@ -754,6 +922,239 @@ class LTMemoryPipelineTests(unittest.TestCase):
         self.assertIsNone(row2["last_embedding_error"])
         self.assertEqual(int(row2["embedding_dims"]), 4)
         self.assertIsNotNone(row2["embedding_blob"])
+
+    def test_identity_dedup_with_canonical_english_storage(self):
+        conn = make_test_db()
+        tracer = CapturingTracer()
+        user = "u_identity_dedup"
+        session = "s_identity_dedup"
+        cfg = LTConfig(min_importance=0.5, min_confidence=0.6, min_st_turns=1, max_st_turns=80)
+
+        conn.execute(
+            """
+            INSERT INTO chat_history(
+              user_id, session_id, turn_id, ts, role, content,
+              tool_name, tool_args_json, tool_result_json, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0)
+            """,
+            (user, session, 1, 1_700_300_001, "user", "Salut je suis Victor"),
+        )
+        conn.execute(
+            """
+            INSERT INTO chat_history(
+              user_id, session_id, turn_id, ts, role, content,
+              tool_name, tool_args_json, tool_result_json, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0)
+            """,
+            (user, session, 2, 1_700_300_002, "user", "Rappelle-toi bien de mon nom"),
+        )
+        conn.commit()
+
+        llm = StaticLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "action": "create",
+                            "entity_type": "identity",
+                            "entity_name": "user_name",
+                            "description": "User is named Victor",
+                            "attributes": {"canonical_value_en": "User name is Victor"},
+                            "confidence": 0.95,
+                            "importance": 0.95,
+                            "evidence_span": "Salut je suis Victor",
+                            "source_turn_ids": [1],
+                        }
+                    ]
+                ),
+                json.dumps(
+                    [
+                        {
+                            "action": "update",
+                            "entity_type": "identity",
+                            "entity_name": "user_name",
+                            "description": "Keep user name Victor",
+                            "attributes": {"canonical_value_en": "User name is Victor"},
+                            "confidence": 0.95,
+                            "importance": 0.95,
+                            "evidence_span": "Rappelle-toi bien de mon nom",
+                            "source_turn_ids": [2],
+                        }
+                    ]
+                ),
+            ]
+        )
+
+        upserted_1 = maybe_distill_profile_from_st_window(
+            db=conn,
+            llm=llm,
+            embeddings=StableEmbeddings(),
+            tracer=tracer,
+            correlation_id="c-id-dedup-1",
+            user_id=user,
+            session_id=session,
+            cfg=cfg,
+            include_latest_mt_context=False,
+        )
+        upserted_2 = maybe_distill_profile_from_st_window(
+            db=conn,
+            llm=llm,
+            embeddings=StableEmbeddings(),
+            tracer=tracer,
+            correlation_id="c-id-dedup-2",
+            user_id=user,
+            session_id=session,
+            cfg=cfg,
+            include_latest_mt_context=False,
+        )
+        self.assertEqual(upserted_1, 1)
+        self.assertEqual(upserted_2, 1)
+
+        rows = conn.execute(
+            """
+            SELECT kind, mem_key, value, archived
+            FROM memory_items
+            WHERE user_id = ? AND kind = 'identity' AND archived = 0
+            """,
+            (user,),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["mem_key"], "identity.user_name")
+        self.assertEqual(rows[0]["value"], "User name is Victor")
+
+    def test_project_dedup_and_abandonment_transition_archives_project(self):
+        conn = make_test_db()
+        tracer = CapturingTracer()
+        user = "u_project_transition"
+        session = "s_project_transition"
+        cfg = LTConfig(min_importance=0.5, min_confidence=0.6, min_st_turns=1, max_st_turns=80)
+
+        conn.execute(
+            """
+            INSERT INTO chat_history(
+              user_id, session_id, turn_id, ts, role, content,
+              tool_name, tool_args_json, tool_result_json, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0)
+            """,
+            (user, session, 1, 1_700_310_001, "user", "Je travaille sur Parktage"),
+        )
+        conn.execute(
+            """
+            INSERT INTO chat_history(
+              user_id, session_id, turn_id, ts, role, content,
+              tool_name, tool_args_json, tool_result_json, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0)
+            """,
+            (user, session, 2, 1_700_310_002, "user", "I am working on project Parktage"),
+        )
+        conn.execute(
+            """
+            INSERT INTO chat_history(
+              user_id, session_id, turn_id, ts, role, content,
+              tool_name, tool_args_json, tool_result_json, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0)
+            """,
+            (user, session, 3, 1_700_310_003, "user", "J'abandonne ce projet"),
+        )
+        conn.commit()
+
+        llm = StaticLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "action": "create",
+                            "entity_type": "project",
+                            "entity_name": "parktage",
+                            "description": "User is working on Parktage",
+                            "attributes": {"canonical_value_en": "Project Parktage"},
+                            "confidence": 0.95,
+                            "importance": 0.95,
+                            "evidence_span": "Je travaille sur Parktage",
+                            "source_turn_ids": [1],
+                        }
+                    ]
+                ),
+                json.dumps(
+                    [
+                        {
+                            "action": "update",
+                            "entity_type": "project",
+                            "entity_name": "parktage",
+                            "description": "Project Parktage",
+                            "attributes": {"canonical_value_en": "Project Parktage"},
+                            "confidence": 0.95,
+                            "importance": 0.95,
+                            "evidence_span": "I am working on project Parktage",
+                            "source_turn_ids": [2],
+                        }
+                    ]
+                ),
+                json.dumps(
+                    [
+                        {
+                            "action": "update",
+                            "entity_type": "project",
+                            "entity_name": "parktage",
+                            "description": "Project abandoned",
+                            "attributes": {
+                                "canonical_value_en": "Project status is abandoned",
+                                "status": "abandoned",
+                                "archive_reason": "user_requested_abandonment",
+                            },
+                            "confidence": 0.95,
+                            "importance": 0.95,
+                            "evidence_span": "J'abandonne ce projet",
+                            "source_turn_ids": [3],
+                        }
+                    ]
+                ),
+            ]
+        )
+
+        for i in range(3):
+            maybe_distill_profile_from_st_window(
+                db=conn,
+                llm=llm,
+                embeddings=StableEmbeddings(),
+                tracer=tracer,
+                correlation_id=f"c-proj-{i}",
+                user_id=user,
+                session_id=session,
+                cfg=cfg,
+                include_latest_mt_context=False,
+            )
+
+        active = retrieve_lt_items(conn, user_id=user, mode="active", limit=10, min_importance=0.0)
+        archived = retrieve_lt_items(conn, user_id=user, mode="archive", limit=10, min_importance=0.0)
+        active_keys = {r["mem_key"] for r in active}
+        archived_keys = {r["mem_key"] for r in archived}
+
+        self.assertIn("project.parktage.status", active_keys)
+        self.assertIn("project.parktage", archived_keys)
+        self.assertNotIn("project.parktage", active_keys)
+
+    def test_no_hardcoded_phrase_matching_for_memory_actions(self):
+        root = Path(__file__).resolve().parents[1] / "src" / "agent"
+        checked = [
+            root / "memory" / "memory_manager.py",
+            root / "memory" / "distill_lt.py",
+            root / "core" / "runtime.py",
+        ]
+        banned_patterns = [
+            'if "' + "oublie" + '" in message',
+            'if "' + "abandonne" + '" in message',
+            'if "' + "forget" + '" in message',
+            'if "' + "do not mention" + '" in message',
+        ]
+        joined = "\n".join(p.read_text(encoding="utf-8") for p in checked)
+        for pattern in banned_patterns:
+            self.assertNotIn(pattern, joined)
 
 
 if __name__ == "__main__":
