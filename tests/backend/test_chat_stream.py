@@ -4,10 +4,10 @@ import asyncio
 import threading
 import unittest
 
-from agent.providers.llm.base import LLMResult
-from agent.api.chat import chat_stream
-from agent.api.dependencies import RuntimeContext
-from agent.api.schemas import ChatStreamRequest
+from agent.infrastructure.providers.llm.base import LLMResult
+from apps.api.routes.chat import chat_stream
+from apps.api.dependencies import RuntimeContext
+from apps.api.schemas import ChatStreamRequest
 
 
 class FakeStreamingLLM:

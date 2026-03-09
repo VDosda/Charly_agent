@@ -80,9 +80,9 @@ pip-delete-this-directory.txt
 .hypothesis/
 .cache/
 node_modules/
-frontend/node_modules/
-frontend/dist/
-frontend/.vite/
+apps/web/node_modules/
+apps/web/dist/
+apps/web/.vite/
 
 # Dependency lock files (uncomment if needed)
 #Pipfile.lock

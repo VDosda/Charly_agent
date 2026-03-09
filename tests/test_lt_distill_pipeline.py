@@ -7,17 +7,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence
 from unittest.mock import patch
 
-from agent.memory.distill_lt import (
+from agent.infrastructure.memory.distill_lt import (
     LTConfig,
     maybe_distill_profile_from_episode,
     maybe_distill_profile_from_st_window,
     retry_pending_lt_embeddings,
 )
-from agent.memory.distill_mt import maybe_create_episode
-from agent.memory.store_lt import upsert_memory_item
-from agent.memory.store_mt import insert_episode
-from agent.providers.embeddings.base import EmbeddingResult
-from agent.providers.llm.base import LLMResult
+from agent.infrastructure.memory.distill_mt import maybe_create_episode
+from agent.infrastructure.memory.store_lt import upsert_memory_item
+from agent.infrastructure.memory.store_mt import insert_episode
+from agent.infrastructure.providers.embeddings.base import EmbeddingResult
+from agent.infrastructure.providers.llm.base import LLMResult
 
 
 MIGRATIONS = [
@@ -94,7 +94,7 @@ class FlakyEmbeddings:
 
 
 def _migrations_dir() -> Path:
-    return Path(__file__).resolve().parents[1] / "src" / "agent" / "db" / "migrations"
+    return Path(__file__).resolve().parents[1] / "src" / "agent" / "infrastructure" / "db" / "migrations"
 
 
 def make_test_db() -> sqlite3.Connection:
@@ -284,7 +284,7 @@ class LTMemoryPipelineTests(unittest.TestCase):
             ]
         )
 
-        with patch("agent.memory.distill_lt.query_topk_item_ids", return_value=[(existing.item_id, 0.01)]):
+        with patch("agent.infrastructure.memory.distill_lt.query_topk_item_ids", return_value=[(existing.item_id, 0.01)]):
             upserted = maybe_distill_profile_from_st_window(
                 db=conn,
                 llm=llm,
