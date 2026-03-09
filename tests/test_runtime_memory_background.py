@@ -16,8 +16,8 @@ from agent.config.settings import (
 )
 from agent.core.runtime import AgentRuntime
 from agent.providers.embeddings.base import EmbeddingResult
-from agent.providers.llm.base import LLMResult
-from agent.skills.registry import ToolRegistry
+from agent.providers.llm.base import LLMResult, ToolCall, ToolSpec
+from agent.skills.registry import Tool, ToolRegistry
 
 
 MIGRATIONS = [
@@ -42,6 +42,45 @@ class FastEmbeddings:
 
     def supports_batch(self) -> bool:
         return True
+
+
+class EchoToolHandler:
+    def execute(self, args, context):
+        return {"echo": args.get("value", "")}
+
+
+class ToolThenSilentLLM:
+    def __init__(self) -> None:
+        self._calls = 0
+
+    def supports_tools(self) -> bool:
+        return True
+
+    def generate(self, messages, tools=None, tool_choice=None):
+        self._calls += 1
+        if self._calls == 1:
+            return LLMResult(
+                text="",
+                tool_calls=[ToolCall(id="tc-1", name="echo_tool", arguments={"value": "ping"})],
+            )
+        return LLMResult(text="", tool_calls=[])
+
+
+class ToolThenTextLLM:
+    def __init__(self) -> None:
+        self._calls = 0
+
+    def supports_tools(self) -> bool:
+        return True
+
+    def generate(self, messages, tools=None, tool_choice=None):
+        self._calls += 1
+        if self._calls == 1:
+            return LLMResult(
+                text="",
+                tool_calls=[ToolCall(id="tc-1", name="echo_tool", arguments={"value": "ping"})],
+            )
+        return LLMResult(text="final tool answer", tool_calls=[])
 
 
 def _migrations_dir() -> Path:
@@ -157,6 +196,76 @@ class RuntimeMemoryBackgroundTests(unittest.TestCase):
 
         self.assertTrue(runtime.wait_memory_idle(timeout_s=2.0))
         self.assertTrue(mt_called.is_set(), "memory worker should continue after LT exception")
+
+    def test_tool_roundtrip_with_empty_final_text_uses_tool_fallback(self):
+        registry = ToolRegistry()
+        registry.register(
+            Tool(
+                spec=ToolSpec(
+                    name="echo_tool",
+                    description="Echo value",
+                    json_schema={
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    },
+                ),
+                handler=EchoToolHandler(),
+            )
+        )
+        runtime = AgentRuntime(
+            db=make_test_db(),
+            llm=ToolThenSilentLLM(),
+            embeddings=FastEmbeddings(),
+            skills=registry,
+            settings=make_settings(),
+        )
+        runtime._maybe_distill_lt_from_st = lambda *, correlation_id, user_id, session_id: 0  # type: ignore[method-assign]
+        runtime._maybe_create_episode = (  # type: ignore[method-assign]
+            lambda *, correlation_id, user_id, session_id: {"episode_id": None, "embedding_retry_count": 0}
+        )
+        runtime._cleanup = lambda user_id, session_id: None  # type: ignore[method-assign]
+
+        resp = runtime.handle_message(user_id="u-tools-1", session_id="s-tools-1", message="use tool")
+
+        self.assertIn("[TOOL RESULT]", resp)
+        self.assertIn("echo_tool", resp)
+        self.assertIn("ping", resp)
+
+    def test_tool_roundtrip_prefers_model_final_text_when_present(self):
+        registry = ToolRegistry()
+        registry.register(
+            Tool(
+                spec=ToolSpec(
+                    name="echo_tool",
+                    description="Echo value",
+                    json_schema={
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    },
+                ),
+                handler=EchoToolHandler(),
+            )
+        )
+        runtime = AgentRuntime(
+            db=make_test_db(),
+            llm=ToolThenTextLLM(),
+            embeddings=FastEmbeddings(),
+            skills=registry,
+            settings=make_settings(),
+        )
+        runtime._maybe_distill_lt_from_st = lambda *, correlation_id, user_id, session_id: 0  # type: ignore[method-assign]
+        runtime._maybe_create_episode = (  # type: ignore[method-assign]
+            lambda *, correlation_id, user_id, session_id: {"episode_id": None, "embedding_retry_count": 0}
+        )
+        runtime._cleanup = lambda user_id, session_id: None  # type: ignore[method-assign]
+
+        resp = runtime.handle_message(user_id="u-tools-2", session_id="s-tools-2", message="use tool")
+
+        self.assertEqual(resp, "final tool answer")
 
 
 if __name__ == "__main__":

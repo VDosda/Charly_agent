@@ -288,6 +288,9 @@ class AgentRuntime:
                 tool_calls=result.tool_calls,
                 session_state=policy_state,
             )
+            # Keep a deterministic fallback if the model does not emit a final
+            # assistant text after the tool call round-trip.
+            final_text = self._flat_tool_fallback_text(tool_msgs)
 
             # Append assistant message that triggered tools
             messages.append(
@@ -452,8 +455,15 @@ class AgentRuntime:
         """
         lines: List[str] = []
         for tm in tool_msgs:
+            content = (tm.get("content") or "").strip()
+            if not content:
+                continue
+            # Some providers return a flattened assistant line that already starts
+            # with the expected transcript marker.
+            if content.startswith("[TOOL RESULT]"):
+                lines.append(content)
+                continue
             name = tm.get("name") or "tool"
-            content = tm.get("content") or ""
             lines.append(f"[TOOL RESULT] {name} => {content}")
         return "\n".join(lines) if lines else "No tool result available."
 
