@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from agent.api.sse import encode_sse_event
+from apps.api.sse import encode_sse_event
 
 
 class SSEFormatTests(unittest.TestCase):

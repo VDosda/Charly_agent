@@ -7,17 +7,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.config.settings import (
+from agent.bootstrap.settings import (
     DatabaseSettings,
     EmbeddingSettings,
     LLMSettings,
     MemorySettings,
     Settings,
 )
-from agent.core.runtime import AgentRuntime
-from agent.providers.embeddings.base import EmbeddingResult
-from agent.providers.llm.base import LLMResult, ToolCall, ToolSpec
-from agent.skills.registry import Tool, ToolRegistry
+from agent.application.runtime import AgentRuntime
+from agent.infrastructure.providers.embeddings.base import EmbeddingResult
+from agent.infrastructure.providers.llm.base import LLMResult, ToolCall, ToolSpec
+from agent.infrastructure.skills.registry import Tool, ToolRegistry
 
 
 MIGRATIONS = [
@@ -84,7 +84,7 @@ class ToolThenTextLLM:
 
 
 def _migrations_dir() -> Path:
-    return Path(__file__).resolve().parents[1] / "src" / "agent" / "db" / "migrations"
+    return Path(__file__).resolve().parents[1] / "src" / "agent" / "infrastructure" / "db" / "migrations"
 
 
 def make_test_db() -> sqlite3.Connection:
@@ -129,7 +129,7 @@ class RuntimeMemoryBackgroundTests(unittest.TestCase):
             captured["min_confidence"] = cfg.min_confidence
             return 0
 
-        with patch("agent.core.runtime.maybe_distill_profile_from_st_window", side_effect=fake_distill):
+        with patch("agent.application.runtime.maybe_distill_profile_from_st_window", side_effect=fake_distill):
             runtime._maybe_distill_lt_from_st(
                 correlation_id="c-thresholds",
                 user_id="u-thresholds",
